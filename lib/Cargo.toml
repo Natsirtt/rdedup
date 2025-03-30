@@ -16,7 +16,7 @@ name = "rdedup_lib"
 path = "src/lib.rs"
 
 [features]
-default = ["with-bzip2", "with-deflate", "with-xz2", "with-zstd", "backend-b2"]
+default = ["with-bzip2", "with-deflate", "with-zstd", "backend-b2"]
 # Optional compression features
 with-bzip2 = ["bzip2"]
 with-deflate = ["flate2"]

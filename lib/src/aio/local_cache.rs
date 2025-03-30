@@ -42,7 +42,11 @@ impl Backend for LocalCache {
 
     fn lock_shared(&self) -> std::io::Result<Box<dyn Lock>> {
         let remote_lock = self.remote.lock_shared()?;
-        let local_lock = self.local.lock_shared()?;
+        // We lock the local cache with an exclusive lock because any read cache miss will trigger
+        // a write operation to the local cache to cache the remotely-read chunk. Currently, the
+        // lock cannot be acquired and released granularly only when needed. This makes a cache-repo
+        // unable to be used even in read-only mode concurrently as of the current implementation.
+        let local_lock = self.local.lock_exclusive()?;
         Ok(Box::new(CombinedLocks::new(vec![remote_lock, local_lock])))
     }
 
@@ -90,18 +94,15 @@ impl BackendThread for LocalCacheThread {
         let result = self.local.read(path.clone());
         match result {
             Ok(data) => {
-                eprintln!("Cache HIT for chunk {}", path.display());
                 Ok(data)
             },
             Err(_) => { // TODO: check if different errors can occur, and only fetch from remote when it's an expected "no such file" or similar error?
-                eprintln!("Cache MISS for chunk {}", path.display());
                 match self.remote.read(path.clone()) {
                     Ok(data) => {
-                        // TODO: I am pretty sure higher level code is in charge of having taken a shared lock for this read; and so that
-                        // triggering a write here is probably a Bad Thing without an exclusive lock. I need to study the codebase more to see
-                        // what to do! Potentially, a dependency of the cache backend is missing: a way to manipulate locks given to it?
                         let cache_result = self.local.write(path, data.clone(), false);
                         if cache_result.is_err() {
+                            // Return an Err anyway? Or how can we both soft-report and error without critically failing since
+                            // technically we do have the data. Anything better than eprintln?
                             eprintln!("Successfully read data from remote; but failed to cache it!");
                         }
                         Ok(data)

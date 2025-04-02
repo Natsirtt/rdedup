@@ -120,13 +120,15 @@
 
 use std::str::FromStr;
 use std::{env, io, path::PathBuf, process};
-
+use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use slog::{info, o, Drain};
 use url::Url;
 
 use rdedup_lib as lib;
-
+use rdedup_lib::backends::Backend;
+use rdedup_lib::backends::local::Local;
+use rdedup_lib::backends::local_cache::LocalCache;
 use crate::lib::settings;
 use crate::lib::Repo;
 
@@ -143,13 +145,15 @@ fn parse_url(s: &str) -> io::Result<Url> {
 #[derive(Clone)]
 struct Options {
     url: Url,
+    cache_dir: Option<PathBuf>,
     settings: settings::Repo,
 }
 
 impl Options {
-    fn new(url: Url) -> Options {
+    fn new(url: Url, cache_dir: Option<PathBuf>) -> Options {
         Options {
             url,
+            cache_dir,
             settings: settings::Repo::new(),
         }
     }
@@ -317,6 +321,11 @@ struct CliOpts {
     /// Path to rdedup repository. Override `RDEDUP_DIR` environment variable
     repo_dir: Option<std::ffi::OsString>,
 
+    // TODO add an `RDEDUP_CACHE_DIR` environment variable for feature parity with --dir and -u
+    #[clap(name = "cachedir", short = 'c', long, value_name = "PATH", required = false)]
+    /// Path to a cache repository. Useful for read speedups when the real repo given to --dir is a network drive.
+    cache_dir: Option<std::ffi::OsString>,
+
     #[clap(
         short = 'u',
         long = "repo",
@@ -464,6 +473,19 @@ enum Command {
     },
 }
 
+fn create_backend(options: &Options) -> io::Result<Box<dyn Backend + Send + Sync>> {
+    match rdedup_lib::backends::from_url(&options.url) {
+        Ok(backend) => {
+            if options.cache_dir.is_none() {
+                return Ok(backend);
+            }
+
+            Ok(Box::new(LocalCache::new(options.cache_dir.clone().unwrap(), backend)))
+        }
+        Err(e) => Err(e)
+    }
+}
+
 fn run() -> io::Result<()> {
     let cli_opts = CliOpts::parse();
 
@@ -511,7 +533,11 @@ fn run() -> io::Result<()> {
         process::exit(-1);
     };
 
-    let mut options = Options::new(url);
+    let cache_dir : Option<PathBuf> = if let Some(dir) = cli_opts.cache_dir {
+        Some(PathBuf::from(&dir).canonicalize()?)
+    } else { None };
+
+    let mut options = Options::new(url, cache_dir);
 
     let log =
         create_logger(cli_opts.verbose as u32, cli_opts.verbose_timings as u32);
@@ -541,39 +567,53 @@ fn run() -> io::Result<()> {
             options.settings.set_compression_level(compression_level);
             options.set_nesting(nesting);
             options.set_hashing(&hashing);
-            let _ = Repo::init(
-                &options.url,
+            if options.cache_dir.is_some() {
+                // We create the cache first since it is optional; so we only clone the settings and
+                // the logger if necessary
+                // TODO atm the cache is a local repo; but abstraction levels are all over the place
+                // since it is implemented as a special backend. Should the cache be implemented as
+                // a whole cache _repo_? Or should we seamlessly use the caching backend without
+                // needing to "seed" it as a repo? Tests and thinking needed!
+                let _ = Repo::init(
+                        Arc::new(move || Ok(Box::new(Local::new(options.cache_dir.clone().unwrap())))),
+                        &read_new_passphrase,
+                        options.settings.clone(),
+                        log.clone(),
+                    )?;
+            let _ = Repo::init_from_url(
+                Arc::new(options.url.clone()),
                 &read_new_passphrase,
                 options.settings,
                 log,
             )?;
+            }
         }
         Command::Store { name } => {
-            let repo = Repo::open(&options.url, log)?;
+            let repo = Repo::open(Arc::new(move || create_backend(&options)), log)?;
             let enc = repo.unlock_encrypt(&read_passphrase)?;
             let stats = repo.write(&name, &mut io::stdin(), &enc)?;
             println!("{} new chunks", stats.new_chunks);
             println!("{} new bytes", stats.new_bytes);
         }
         Command::Load { name } => {
-            let repo = Repo::open(&options.url, log)?;
+            let repo = Repo::open(Arc::new(move || create_backend(&options)), log)?;
             let dec = repo.unlock_decrypt(&read_passphrase)?;
             repo.read(&name, &mut io::stdout(), &dec)?;
         }
         Command::ChangePassphrase => {
-            let mut repo = Repo::open(&options.url, log)?;
+            let mut repo = Repo::open(Arc::new(move || create_backend(&options)), log)?;
             repo.change_passphrase(&read_passphrase, &|| {
                 read_new_passphrase()
             })?;
         }
         Command::Remove { names } => {
-            let repo = Repo::open(&options.url, log)?;
+            let repo = Repo::open(Arc::new(move || create_backend(&options)), log)?;
             for name in names {
                 repo.rm(&name)?;
             }
         }
         Command::Du { names } => {
-            let repo = Repo::open(&options.url, log)?;
+            let repo = Repo::open(Arc::new(move || create_backend(&options)), log)?;
             let dec = repo.unlock_decrypt(&read_passphrase)?;
 
             for name in names {
@@ -583,19 +623,19 @@ fn run() -> io::Result<()> {
             }
         }
         Command::Gc { grace_time } => {
-            let repo = Repo::open(&options.url, log)?;
+            let repo = Repo::open(Arc::new(move || create_backend(&options)), log)?;
 
             repo.gc(grace_time)?;
         }
         Command::List => {
-            let repo = Repo::open(&options.url, log)?;
+            let repo = Repo::open(Arc::new(move || create_backend(&options)), log)?;
 
             for name in repo.list_names()? {
                 println!("{}", name);
             }
         }
         Command::Verify { names } => {
-            let repo = Repo::open(&options.url, log)?;
+            let repo = Repo::open(Arc::new(move || create_backend(&options)), log)?;
             let dec = repo.unlock_decrypt(&read_passphrase)?;
             for name in names {
                 let results = repo.verify(&name, &dec)?;

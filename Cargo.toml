@@ -13,7 +13,7 @@ exclude = ["lib/**/*", "tester/**"]
 edition = "2021"
 
 [features]
-default = ["with-bzip2","with-deflate","with-xz2","with-zstd"]
+default = ["with-bzip2","with-deflate","with-zstd"]
 with-bzip2 = ["rdedup-lib/with-bzip2"]
 with-deflate = ["rdedup-lib/with-deflate"]
 with-xz2 = ["rdedup-lib/with-xz2"]

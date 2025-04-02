@@ -23,6 +23,8 @@ pub(crate) mod b2;
 pub(crate) use self::b2::B2;
 
 pub(crate) mod backend;
+pub(crate) mod local_cache;
+
 use self::backend::*;
 
 // {{{ Misc
@@ -33,7 +35,7 @@ struct WriteArgs {
     complete_tx: Option<mpsc::Sender<io::Result<()>>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Metadata {
     pub len: u64,
     pub is_file: bool,

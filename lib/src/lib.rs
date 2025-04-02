@@ -58,11 +58,22 @@ use self::misc::*;
 
 // Fancy reexport of backends API and particular backends structs
 pub mod backends {
+    use std::io;
+    use url::Url;
+    use crate::aio;
     pub use crate::aio::backend::{Backend, BackendThread, Lock};
     pub use crate::aio::Metadata;
 
+    pub fn from_url(url: &Url) -> io::Result<Box<dyn Backend + Send + Sync>> {
+        aio::backend_from_url(url)
+    }
+
     pub mod local {
         pub use crate::aio::local::{Local, LocalThread};
+    }
+
+    pub mod local_cache {
+        pub use crate::aio::local_cache::{LocalCache, LocalCacheThread};
     }
 
     #[cfg(feature = "backend-b2")]
@@ -77,13 +88,13 @@ type ArcEncrypter = Arc<dyn encryption::Encrypter + Send + Sync + 'static>;
 const INGRESS_BUFFER_SIZE: usize = 128 * 1024;
 const DIGEST_SIZE: usize = 32;
 
-/// Type of user provided closure that will ask user for a passphrase is needed
+/// Type of user provided closure that will ask user for a passphrase if needed
 pub type PassphraseFn<'a> = &'a dyn Fn() -> io::Result<String>;
 
-/// Type of user provided closure that will find backend based on URL
-pub type BackendSelectFn = &'static (dyn Fn(&Url) -> io::Result<Box<dyn backends::Backend + Send + Sync>>
+/// Type of user provided closure that will find the backend
+pub type BackendSelectFn = dyn Fn() -> io::Result<Box<dyn backends::Backend + Send + Sync>>
               + Send
-              + Sync);
+              + Sync;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 /// Data type (index/data)
@@ -130,8 +141,7 @@ pub struct EncryptHandle {
 /// Rdedup repository handle
 #[derive(Clone)]
 pub struct Repo {
-    url: Url,
-    backend_select: BackendSelectFn,
+    backend_select: Arc<BackendSelectFn>,
     config: config::Repo,
 
     compression: compression::ArcCompression,
@@ -182,9 +192,9 @@ impl Repo {
         Ok(())
     }
 
-    /// Create new rdedup repository
-    pub fn init<L>(
-        url: &Url,
+    /// Convenience function for creating a new rdedup repository using the bakend_from_url factory
+    pub fn init_from_url<L>(
+        url: Arc<Url>,
         passphrase: PassphraseFn<'_>,
         settings: settings::Repo,
         log: L,
@@ -192,26 +202,25 @@ impl Repo {
     where
         L: Into<Option<Logger>>,
     {
-        Self::init_custom(
-            url,
-            &aio::backend_from_url,
+        Self::init(
+            Arc::new(move || aio::backend_from_url(url.as_ref())),
             passphrase,
             settings,
             log,
         )
     }
 
-    pub fn open<L>(url: &Url, log: L) -> Result<Repo>
+    /// Convenience function for opening a repo using the backend_from_url factory
+    pub fn open_from_url<L>(url: Arc<Url>, log: L) -> Result<Repo>
     where
         L: Into<Option<Logger>>,
     {
-        Self::open_custom(url, &aio::backend_from_url, log)
+        Self::open(Arc::new(move || aio::backend_from_url(url.as_ref())), log)
     }
 
     /// Create new rdedup repository
-    pub fn init_custom<L>(
-        url: &Url,
-        backend_select: BackendSelectFn,
+    pub fn init<L>(
+        backend_select: Arc<BackendSelectFn>,
         passphrase: PassphraseFn<'_>,
         settings: settings::Repo,
         log: L,
@@ -223,7 +232,7 @@ impl Repo {
             .into()
             .unwrap_or_else(|| Logger::root(slog::Discard, o!()));
 
-        let backend = backend_select(url)?;
+        let backend = backend_select()?;
         let aio = aio::AsyncIO::new(backend, log.clone())?;
 
         Repo::ensure_repo_empty_or_new(&aio)?;
@@ -234,7 +243,6 @@ impl Repo {
         let hasher = config.hashing.to_hasher();
 
         Ok(Repo {
-            url: url.clone(),
             backend_select,
             config,
             compression,
@@ -244,9 +252,9 @@ impl Repo {
         })
     }
 
-    pub fn open_custom<L>(
-        url: &Url,
-        backend_select: BackendSelectFn,
+    /// Open an existing repository
+    pub fn open<L>(
+        backend_select: Arc<BackendSelectFn>,
         log: L,
     ) -> Result<Repo>
     where
@@ -256,7 +264,7 @@ impl Repo {
             .into()
             .unwrap_or_else(|| Logger::root(slog::Discard, o!()));
 
-        let backend = backend_select(url)?;
+        let backend = backend_select()?;
         let aio = aio::AsyncIO::new(backend, log.clone())?;
 
         let config = config::Repo::read(&aio)?;
@@ -264,7 +272,6 @@ impl Repo {
         let compression = config.compression.to_engine();
         let hasher = config.hashing.to_hasher();
         Ok(Repo {
-            url: url.clone(),
             backend_select,
             config,
             compression,
@@ -840,7 +847,7 @@ impl Repo {
         let (chunker_tx, chunker_rx) =
             mpsc::sync_channel(self.write_cpu_thread_num());
 
-        let backend = (self.backend_select)(&self.url)?;
+        let backend = (self.backend_select)()?;
         let aio = aio::AsyncIO::new(backend, self.log.clone())?;
 
         let stats = aio.stats();

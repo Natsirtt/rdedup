@@ -6,3 +6,4 @@ backup/
 Cargo.lock
 !./Cargo.lock
 rusty-tags.vi
+.idea/

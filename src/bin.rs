@@ -575,18 +575,18 @@ fn run() -> io::Result<()> {
                 // a whole cache _repo_? Or should we seamlessly use the caching backend without
                 // needing to "seed" it as a repo? Tests and thinking needed!
                 let _ = Repo::init(
-                        Arc::new(move || Ok(Box::new(Local::new(options.cache_dir.clone().unwrap())))),
-                        &read_new_passphrase,
-                        options.settings.clone(),
-                        log.clone(),
-                    )?;
+                    Arc::new(move || Ok(Box::new(Local::new(options.cache_dir.clone().unwrap())))),
+                    &read_new_passphrase,
+                    options.settings.clone(),
+                    log.clone(),
+                )?;
+            }
             let _ = Repo::init_from_url(
                 Arc::new(options.url.clone()),
                 &read_new_passphrase,
                 options.settings,
                 log,
             )?;
-            }
         }
         Command::Store { name } => {
             let repo = Repo::open(Arc::new(move || create_backend(&options)), log)?;

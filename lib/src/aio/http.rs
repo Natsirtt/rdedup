@@ -1,11 +1,11 @@
-use std::{io, mem};
-use std::path::PathBuf;
-use std::sync::mpsc::Sender;
-use serde::Deserialize;
-use url::Url;
-use sgdata::SGData;
 use crate::aio::Metadata;
 use crate::backends::{Backend, BackendThread, Lock};
+use serde::Deserialize;
+use sgdata::SGData;
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
+use std::{io, mem};
+use url::Url;
 
 // TODO: This is meant to be a "read-only" http backend that can get data from a remote repository,
 // ideally served very efficiently with a static web server (for instance, rust's static-web-server
@@ -43,40 +43,58 @@ pub struct HttpReadOnlyThread {
 
 impl HttpReadOnlyThread {
     pub fn new(base_url: Url) -> Self {
-        HttpReadOnlyThread {
-            base_url,
-        }
+        HttpReadOnlyThread { base_url }
     }
 
     fn get_endpoint(&self, path: PathBuf) -> Result<Url, io::Error> {
         self.base_url.join(path.to_str().unwrap()).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to build endpoint: {}", e))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to build endpoint: {}", e),
+            )
         })
     }
 
-    fn get_blocking(&self, path: PathBuf) -> io::Result<reqwest::blocking::Response> {
+    fn get_blocking(
+        &self,
+        path: PathBuf,
+    ) -> io::Result<reqwest::blocking::Response> {
         reqwest::blocking::get(self.get_endpoint(path)?).map_err(|e| {
-            io::Error::new(io::ErrorKind::ConnectionAborted, format!("Request failed: {:?}", e))
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("Request failed: {:?}", e),
+            )
         })
     }
 }
 
 impl Backend for HttpReadOnly {
     fn lock_exclusive(&self) -> io::Result<Box<dyn Lock>> {
-        Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "Static HTTP endpoint is read-only"))
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "Static HTTP endpoint is read-only",
+        ))
     }
 
     fn lock_shared(&self) -> io::Result<Box<dyn Lock>> {
-        Ok(Box::new(NoLock{}))
+        Ok(Box::new(NoLock {}))
     }
 
     fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
-       Ok(Box::new(HttpReadOnlyThread::new(self.base_url.clone())))
+        Ok(Box::new(HttpReadOnlyThread::new(self.base_url.clone())))
     }
 }
 
-fn get_content_type(response: &reqwest::blocking::Response) -> io::Result<&reqwest::header::HeaderValue> {
-    response.headers().get(reqwest::header::CONTENT_TYPE).ok_or(io::Error::new(io::ErrorKind::InvalidData, "No content type header"))
+fn get_content_type(
+    response: &reqwest::blocking::Response,
+) -> io::Result<&reqwest::header::HeaderValue> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .ok_or(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No content type header",
+        ))
 }
 
 fn is_file_content_type(header: &reqwest::header::HeaderValue) -> bool {
@@ -89,73 +107,140 @@ fn is_directory_content_type(header: &reqwest::header::HeaderValue) -> bool {
 
 impl BackendThread for HttpReadOnlyThread {
     fn remove_dir_all(&mut self, _path: PathBuf) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "Static HTTP endpoint is read-only"))
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "Static HTTP endpoint is read-only",
+        ))
     }
 
-    fn rename(&mut self, _src_path: PathBuf, _dst_path: PathBuf) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "Static HTTP endpoint is read-only"))
+    fn rename(
+        &mut self,
+        _src_path: PathBuf,
+        _dst_path: PathBuf,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "Static HTTP endpoint is read-only",
+        ))
     }
 
-    fn write(&mut self, _path: PathBuf, _sg: SGData, _idempotent: bool) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "Static HTTP endpoint is read-only"))
+    fn write(
+        &mut self,
+        _path: PathBuf,
+        _sg: SGData,
+        _idempotent: bool,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "Static HTTP endpoint is read-only",
+        ))
     }
 
     fn read(&mut self, path: PathBuf) -> io::Result<SGData> {
         let response = self.get_blocking(path)?;
         let content_type = get_content_type(&response)?;
-        if !is_file_content_type(&content_type) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid content type {}", content_type.to_str().unwrap())));
+        if !is_file_content_type(content_type) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid content type {}",
+                    content_type.to_str().unwrap()
+                ),
+            ));
         }
 
         let data = response.bytes().map_err(|e| {
-            io::Error::new(io::ErrorKind::ConnectionAborted, format!("Failed to read response as bytes: {}", e))
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("Failed to read response as bytes: {}", e),
+            )
         })?;
 
         Ok(SGData::from_single(data.into()))
     }
 
     fn remove(&mut self, _path: PathBuf) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "Static HTTP endpoint is read-only"))
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "Static HTTP endpoint is read-only",
+        ))
     }
 
     fn read_metadata(&mut self, path: PathBuf) -> io::Result<Metadata> {
         let as_path = path.as_path();
-        let filename = as_path.file_name().unwrap().to_str().unwrap().to_string();
-        let response = self.get_blocking(PathBuf::from(as_path.parent().unwrap()))?;
+        let filename =
+            as_path.file_name().unwrap().to_str().unwrap().to_string();
+        let response =
+            self.get_blocking(PathBuf::from(as_path.parent().unwrap()))?;
         let content_type = get_content_type(&response)?;
 
         if !is_directory_content_type(content_type) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid content type '{:?}'", content_type.to_str().unwrap())));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid content type '{:?}'",
+                    content_type.to_str().unwrap()
+                ),
+            ));
         }
 
         let file_list: Vec<FileInfo> = response.json().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse response as JSON: {:?}", e))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse response as JSON: {:?}", e),
+            )
         })?;
-        let file: &FileInfo = file_list.iter().find(|f| f.name == filename).ok_or(io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
+        let file: &FileInfo = file_list
+            .iter()
+            .find(|f| f.name == filename)
+            .ok_or(io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
         if !file.file_type.eq("file") {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} is not a file", filename)))
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a file", filename),
+            ));
         }
-        let m_datetime = chrono::DateTime::parse_from_rfc3339(file.mtime.as_str()).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse mtime to a datetime: {:?}", e))
+        let m_datetime = chrono::DateTime::parse_from_rfc3339(
+            file.mtime.as_str(),
+        )
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse mtime to a datetime: {:?}", e),
+            )
         })?;
         Ok(Metadata {
-            len: file.size.expect("This is a file, so it should have a size."),
+            len: file
+                .size
+                .expect("This is a file, so it should have a size."),
             is_file: true,
-            created: m_datetime.into()
+            created: m_datetime.into(),
         })
     }
 
     fn list(&mut self, path: PathBuf) -> io::Result<Vec<PathBuf>> {
         let response = self.get_blocking(path.clone())?;
         if !response.status().is_success() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Bad response code: {}", response.status())));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Bad response code: {}", response.status()),
+            ));
         }
         let content_type = get_content_type(&response)?;
         if !is_directory_content_type(content_type) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid content type {}", content_type.to_str().unwrap())));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid content type {}",
+                    content_type.to_str().unwrap()
+                ),
+            ));
         }
         let file_list: Vec<FileInfo> = response.json().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse response as JSON: {:?}", e))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse response as JSON: {:?}", e),
+            )
         })?;
         let mut result = Vec::with_capacity(128);
         for file in file_list {
@@ -164,18 +249,33 @@ impl BackendThread for HttpReadOnlyThread {
         Ok(result)
     }
 
-    fn list_recursively(&mut self, path: PathBuf, tx: Sender<io::Result<Vec<PathBuf>>>) {
+    fn list_recursively(
+        &mut self,
+        path: PathBuf,
+        tx: Sender<io::Result<Vec<PathBuf>>>,
+    ) {
         let mut to_process = vec![path];
         let mut result = Vec::with_capacity(128);
         while let Some(path) = to_process.pop() {
             let response = self.get_blocking(path.clone()).unwrap();
             if !response.status().is_success() {
-                tx.send(Err(io::Error::new(io::ErrorKind::InvalidData, format!("Bad response code: {}", response.status())))).expect("Send failed");
+                tx.send(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Bad response code: {}", response.status()),
+                )))
+                .expect("Send failed");
                 continue;
             }
             let content_type = get_content_type(&response).unwrap();
             if !is_directory_content_type(content_type) {
-                tx.send(Err(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid content type {}", content_type.to_str().unwrap())))).expect("Send failed");
+                tx.send(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid content type {}",
+                        content_type.to_str().unwrap()
+                    ),
+                )))
+                .expect("Send failed");
                 continue;
             }
 
@@ -198,4 +298,3 @@ impl BackendThread for HttpReadOnlyThread {
         }
     }
 }
-

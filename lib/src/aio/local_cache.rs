@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-use std::sync::mpsc::Sender;
-use sgdata::SGData;
 use crate::aio::{Local, Metadata};
 use crate::backends::{Backend, BackendThread, Lock};
+use sgdata::SGData;
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 
 pub struct LocalCache {
     local: Box<Local>,
@@ -11,7 +11,7 @@ pub struct LocalCache {
 
 struct CombinedLocks {
     #[allow(dead_code)]
-    locks: Vec<Box<dyn Lock>>
+    locks: Vec<Box<dyn Lock>>,
 }
 
 impl CombinedLocks {
@@ -29,7 +29,10 @@ pub struct LocalCacheThread {
 
 impl LocalCache {
     pub fn new(path: PathBuf, remote: Box<dyn Backend>) -> Self {
-       LocalCache { local: Box::new(Local::new(path)), remote }
+        LocalCache {
+            local: Box::new(Local::new(path)),
+            remote,
+        }
     }
 }
 
@@ -53,12 +56,10 @@ impl Backend for LocalCache {
     fn new_thread(&self) -> std::io::Result<Box<dyn BackendThread>> {
         let local_thread = self.local.new_thread()?;
         let remote_thread = self.remote.new_thread()?;
-        Ok(
-            Box::new(LocalCacheThread {
-                local: local_thread,
-                remote: remote_thread
-            })
-        )
+        Ok(Box::new(LocalCacheThread {
+            local: local_thread,
+            remote: remote_thread,
+        }))
     }
 }
 
@@ -70,44 +71,53 @@ impl BackendThread for LocalCacheThread {
         let result = self.remote.remove_dir_all(path.clone());
         match result {
             Ok(()) => self.local.remove_dir_all(path),
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 
-    fn rename(&mut self, src_path: PathBuf, dst_path: PathBuf) -> std::io::Result<()> {
+    fn rename(
+        &mut self,
+        src_path: PathBuf,
+        dst_path: PathBuf,
+    ) -> std::io::Result<()> {
         let result = self.remote.rename(src_path.clone(), dst_path.clone());
         match result {
             Ok(()) => self.local.rename(src_path, dst_path),
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 
-    fn write(&mut self, path: PathBuf, sg: SGData, idempotent: bool) -> std::io::Result<()> {
+    fn write(
+        &mut self,
+        path: PathBuf,
+        sg: SGData,
+        idempotent: bool,
+    ) -> std::io::Result<()> {
         let result = self.remote.write(path.clone(), sg.clone(), idempotent);
         match result {
             Ok(()) => self.local.write(path, sg, idempotent),
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 
     fn read(&mut self, path: PathBuf) -> std::io::Result<SGData> {
         let result = self.local.read(path.clone());
         match result {
-            Ok(data) => {
-                Ok(data)
-            },
-            Err(_) => { // TODO: check if different errors can occur, and only fetch from remote when it's an expected "no such file" or similar error?
+            Ok(data) => Ok(data),
+            Err(_) => {
+                // TODO: check if different errors can occur, and only fetch from remote when it's an expected "no such file" or similar error?
                 match self.remote.read(path.clone()) {
                     Ok(data) => {
-                        let cache_result = self.local.write(path, data.clone(), false);
+                        let cache_result =
+                            self.local.write(path, data.clone(), false);
                         if cache_result.is_err() {
                             // Return an Err anyway? Or how can we both soft-report and error without critically failing since
                             // technically we do have the data. Anything better than eprintln?
                             eprintln!("Successfully read data from remote; but failed to cache it!");
                         }
                         Ok(data)
-                    },
-                    Err(e) => Err(e)
+                    }
+                    Err(e) => Err(e),
                 }
             }
         }
@@ -117,7 +127,7 @@ impl BackendThread for LocalCacheThread {
         let result = self.remote.remove(path.clone());
         match result {
             Ok(()) => self.local.remove(path),
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 
@@ -130,7 +140,11 @@ impl BackendThread for LocalCacheThread {
         self.remote.list(path)
     }
 
-    fn list_recursively(&mut self, path: PathBuf, tx: Sender<std::io::Result<Vec<PathBuf>>>) {
+    fn list_recursively(
+        &mut self,
+        path: PathBuf,
+        tx: Sender<std::io::Result<Vec<PathBuf>>>,
+    ) {
         self.remote.list_recursively(path, tx)
     }
 }

@@ -58,11 +58,11 @@ use self::misc::*;
 
 // Fancy reexport of backends API and particular backends structs
 pub mod backends {
-    use std::io;
-    use url::Url;
     use crate::aio;
     pub use crate::aio::backend::{Backend, BackendThread, Lock};
     pub use crate::aio::Metadata;
+    use std::io;
+    use url::Url;
 
     pub fn from_url(url: &Url) -> io::Result<Box<dyn Backend + Send + Sync>> {
         aio::backend_from_url(url)
@@ -98,8 +98,8 @@ pub type PassphraseFn<'a> = &'a dyn Fn() -> io::Result<String>;
 
 /// Type of user provided closure that will find the backend
 pub type BackendSelectFn = dyn Fn() -> io::Result<Box<dyn backends::Backend + Send + Sync>>
-              + Send
-              + Sync;
+    + Send
+    + Sync;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 /// Data type (index/data)
@@ -258,10 +258,7 @@ impl Repo {
     }
 
     /// Open an existing repository
-    pub fn open<L>(
-        backend_select: Arc<BackendSelectFn>,
-        log: L,
-    ) -> Result<Repo>
+    pub fn open<L>(backend_select: Arc<BackendSelectFn>, log: L) -> Result<Repo>
     where
         L: Into<Option<Logger>>,
     {

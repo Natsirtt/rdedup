@@ -9,7 +9,7 @@ pub enum Error {
     NotFound,
     Exists,
     InvalidPubKey,
-    DecryptionFailed
+    DecryptionFailed,
 }
 
 impl From<io::Error> for Error {
@@ -17,5 +17,3 @@ impl From<io::Error> for Error {
         Error::Io(err)
     }
 }
-
-

@@ -72,7 +72,9 @@ impl pwhash::PWHash for PWHash {
 // }}}
 
 // {{{ Hashing
-#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Copy, Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq,
+)]
 #[serde(tag = "type")]
 pub enum Hashing {
     #[serde(rename = "sha256")]

@@ -371,7 +371,7 @@ struct AsyncIOThread {
 /// Guard that removes entry from the pending paths on drop
 struct PendingGuard<'a, 'b>(&'a AsyncIOThread, &'b Path);
 
-impl<'a, 'b> Drop for PendingGuard<'a, 'b> {
+impl Drop for PendingGuard<'_, '_> {
     fn drop(&mut self) {
         let mut sh = self.0.shared.inner.lock().unwrap();
         sh.in_progress.remove(self.1);

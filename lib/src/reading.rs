@@ -47,7 +47,7 @@ impl<'a, 'b> IndexTranslator<'a, 'b> {
     }
 }
 
-impl<'a, 'b> Write for IndexTranslator<'a, 'b> {
+impl Write for IndexTranslator<'_, '_> {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         assert!(!bytes.is_empty());
 
@@ -113,7 +113,7 @@ impl<'a, 'b> Write for IndexTranslator<'a, 'b> {
     }
 }
 
-impl<'a, 'b> Drop for IndexTranslator<'a, 'b> {
+impl Drop for IndexTranslator<'_, '_> {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             debug_assert_eq!(self.digest_buf.0.len(), 0);
@@ -223,8 +223,6 @@ impl<'a> ReadContext<'a> {
 
 /// Abstraction over accessing chunks stored in the repository
 pub(crate) trait ChunkAccessor {
-    fn repo(&self) -> &Repo;
-
     /// Read a chunk identified by `digest` into `writer`
     fn read_chunk_into(
         &self,
@@ -261,11 +259,7 @@ impl<'a> DefaultChunkAccessor<'a> {
     }
 }
 
-impl<'a> ChunkAccessor for DefaultChunkAccessor<'a> {
-    fn repo(&self) -> &Repo {
-        self.repo
-    }
-
+impl ChunkAccessor for DefaultChunkAccessor<'_> {
     fn read_chunk_into(
         &self,
         digest: DigestRef<'_>,
@@ -352,7 +346,7 @@ impl<'a> ChunkAccessor for DefaultChunkAccessor<'a> {
             ))
         } else {
             for part in data.as_parts() {
-                writer.write_all(&**part)?;
+                writer.write_all(part)?;
             }
             Ok(())
         }
@@ -392,11 +386,7 @@ impl<'a> RecordingChunkAccessor<'a> {
     }
 }
 
-impl<'a> ChunkAccessor for RecordingChunkAccessor<'a> {
-    fn repo(&self) -> &Repo {
-        self.raw.repo()
-    }
-
+impl ChunkAccessor for RecordingChunkAccessor<'_> {
     fn read_chunk_into(
         &self,
         digest: DigestRef<'_>,
@@ -450,11 +440,7 @@ impl<'a> VerifyingChunkAccessor<'a> {
     }
 }
 
-impl<'a> ChunkAccessor for VerifyingChunkAccessor<'a> {
-    fn repo(&self) -> &Repo {
-        self.raw.repo()
-    }
-
+impl ChunkAccessor for VerifyingChunkAccessor<'_> {
     fn read_chunk_into(
         &self,
         digest: DigestRef<'_>,
@@ -506,11 +492,7 @@ impl<'a> GenerationUpdateChunkAccessor<'a> {
     }
 }
 
-impl<'a> ChunkAccessor for GenerationUpdateChunkAccessor<'a> {
-    fn repo(&self) -> &Repo {
-        self.raw.repo()
-    }
-
+impl ChunkAccessor for GenerationUpdateChunkAccessor<'_> {
     fn read_chunk_into(
         &self,
         digest: DigestRef<'_>,

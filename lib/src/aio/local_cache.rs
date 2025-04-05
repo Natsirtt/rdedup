@@ -4,13 +4,13 @@ use sgdata::SGData;
 use crate::aio::{Local, Metadata};
 use crate::backends::{Backend, BackendThread, Lock};
 
-//#[derive(Debug)]
 pub struct LocalCache {
     local: Box<Local>,
     remote: Box<dyn Backend>,
 }
 
 struct CombinedLocks {
+    #[allow(dead_code)]
     locks: Vec<Box<dyn Lock>>
 }
 

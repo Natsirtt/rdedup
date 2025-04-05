@@ -47,7 +47,8 @@ impl Backend for Local {
         let lock_path = lock_file_path(&self.path);
 
         let file = fs::File::create(&lock_path)?;
-        file.lock_shared()?;
+        // TODO consider switching to std equivalents, they seem to exist now
+        fs2::FileExt::lock_shared(&file)?;
 
         Ok(Box::new(file))
     }

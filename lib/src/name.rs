@@ -249,7 +249,7 @@ impl Name {
     }
 }
 
-impl<'a> From<DataAddressRef<'a>> for Name {
+impl From<DataAddressRef<'_>> for Name {
     fn from(da: DataAddressRef<'_>) -> Self {
         Name {
             digest: da.digest.0.into(),

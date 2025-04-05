@@ -204,7 +204,7 @@ impl<'a> SGReader<'a> {
     }
 }
 
-impl<'a> io::Read for SGReader<'a> {
+impl Read for SGReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             if self.parts_i >= self.parts.len() {

@@ -1,8 +1,6 @@
 use std::{io, mem};
-use std::io:: Read;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-use reqwest;
 use serde::Deserialize;
 use url::Url;
 use sgdata::SGData;
@@ -90,15 +88,15 @@ fn is_directory_content_type(header: &reqwest::header::HeaderValue) -> bool {
 }
 
 impl BackendThread for HttpReadOnlyThread {
-    fn remove_dir_all(&mut self, path: PathBuf) -> io::Result<()> {
+    fn remove_dir_all(&mut self, _path: PathBuf) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "Static HTTP endpoint is read-only"))
     }
 
-    fn rename(&mut self, src_path: PathBuf, dst_path: PathBuf) -> io::Result<()> {
+    fn rename(&mut self, _src_path: PathBuf, _dst_path: PathBuf) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "Static HTTP endpoint is read-only"))
     }
 
-    fn write(&mut self, path: PathBuf, sg: SGData, idempotent: bool) -> io::Result<()> {
+    fn write(&mut self, _path: PathBuf, _sg: SGData, _idempotent: bool) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "Static HTTP endpoint is read-only"))
     }
 
@@ -116,7 +114,7 @@ impl BackendThread for HttpReadOnlyThread {
         Ok(SGData::from_single(data.into()))
     }
 
-    fn remove(&mut self, path: PathBuf) -> io::Result<()> {
+    fn remove(&mut self, _path: PathBuf) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "Static HTTP endpoint is read-only"))
     }
 
@@ -126,7 +124,7 @@ impl BackendThread for HttpReadOnlyThread {
         let response = self.get_blocking(PathBuf::from(as_path.parent().unwrap()))?;
         let content_type = get_content_type(&response)?;
 
-        if !is_directory_content_type(&content_type) {
+        if !is_directory_content_type(content_type) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid content type '{:?}'", content_type.to_str().unwrap())));
         }
 
@@ -153,7 +151,7 @@ impl BackendThread for HttpReadOnlyThread {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Bad response code: {}", response.status())));
         }
         let content_type = get_content_type(&response)?;
-        if !is_directory_content_type(&content_type) {
+        if !is_directory_content_type(content_type) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid content type {}", content_type.to_str().unwrap())));
         }
         let file_list: Vec<FileInfo> = response.json().map_err(|e| {
@@ -176,7 +174,7 @@ impl BackendThread for HttpReadOnlyThread {
                 continue;
             }
             let content_type = get_content_type(&response).unwrap();
-            if !is_directory_content_type(&content_type) {
+            if !is_directory_content_type(content_type) {
                 tx.send(Err(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid content type {}", content_type.to_str().unwrap())))).expect("Send failed");
                 continue;
             }

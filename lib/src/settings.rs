@@ -49,42 +49,32 @@ impl Compression {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum Encryption {
     Curve25519,
+    #[default]
     None,
-}
-
-impl Default for Encryption {
-    fn default() -> Self {
-        Encryption::Curve25519
-    }
 }
 
 // Unlike encryption, settings == config here
 #[derive(Clone, Default)]
 pub struct Chunking(pub(crate) config::Chunking);
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum PWHash {
     Weak,
     Interactive,
+    #[default]
     Strong,
 }
 
-impl Default for PWHash {
-    fn default() -> Self {
-        PWHash::Strong
-    }
-}
-
-impl<'a> From<&'a str> for PWHash {
+impl From<&'_ str> for PWHash {
     fn from(s: &str) -> Self {
         match s {
             "weak" => PWHash::Weak,
             "interactive" => PWHash::Interactive,
             "strong" => PWHash::Strong,
-            _ => panic!("Wrong pwhash strenght string"),
+            _ => panic!("Wrong pwhash strength string"),
         }
     }
 }
@@ -103,9 +93,10 @@ impl Nesting {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum Hashing {
     Sha256,
+    #[default]
     Blake2b,
 }
 
@@ -115,12 +106,6 @@ impl Hashing {
             Hashing::Sha256 => config::Hashing::Sha256,
             Hashing::Blake2b => config::Hashing::Blake2b,
         }
-    }
-}
-
-impl Default for Hashing {
-    fn default() -> Self {
-        Hashing::Blake2b
     }
 }
 

@@ -65,8 +65,8 @@ impl Generation {
                 ),
             ));
         }
-        let rand_bytes: std::result::Result<Vec<u8>, hex::FromHexError> =
-            FromHex::from_hex(&rand_s.as_bytes());
+        let rand_bytes: Result<Vec<u8>, hex::FromHexError> =
+            FromHex::from_hex(rand_s.as_bytes());
         let rand: u64 = match rand_bytes {
             Ok(mut bytes) => {
                 let bytes: Vec<u8> = bytes.drain(..).rev().collect();
@@ -83,8 +83,8 @@ impl Generation {
             }
         };
 
-        let seq_bytes: std::result::Result<Vec<u8>, hex::FromHexError> =
-            FromHex::from_hex(&seq_s.as_bytes());
+        let seq_bytes: Result<Vec<u8>, hex::FromHexError> =
+            FromHex::from_hex(seq_s.as_bytes());
         let seq: u64 = match seq_bytes {
             Ok(mut bytes) => {
                 let bytes: Vec<u8> = bytes.drain(..).rev().collect();

@@ -110,7 +110,7 @@ impl<I: Iterator<Item = Vec<u8>>> Iterator for Chunker<I> {
                     .next()
                     .map(|v| ArcRef::new(Arc::new(v)).map(|a| a.as_slice()))
             }) {
-                if let Some((last, rest)) = self.chunking.find_chunk(&*buf) {
+                if let Some((last, rest)) = self.chunking.find_chunk(&buf) {
                     debug_assert_eq!(last.len() + rest.len(), buf.len());
                     self.incomplete_chunk
                         .push_arcref(buf.clone().map(|cur| &cur[..last.len()]));

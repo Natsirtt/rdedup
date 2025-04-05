@@ -72,19 +72,14 @@ impl pwhash::PWHash for PWHash {
 // }}}
 
 // {{{ Hashing
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum Hashing {
     #[serde(rename = "sha256")]
+    #[default]
     Sha256,
     #[serde(rename = "blake2b")]
     Blake2b,
-}
-
-impl Default for Hashing {
-    fn default() -> Hashing {
-        Hashing::Sha256
-    }
 }
 
 impl Hashing {
@@ -113,7 +108,7 @@ impl Nesting {
         digest: &[u8],
         gen_str: &str,
     ) -> PathBuf {
-        let hex_digest = hex::encode(&digest);
+        let hex_digest = hex::encode(digest);
         let mut dir = PathBuf::from(gen_str);
         dir.push(base);
         let levels = self.clone().0;

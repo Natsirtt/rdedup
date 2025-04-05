@@ -76,7 +76,7 @@ pub mod backends {
         pub use crate::aio::local_cache::{LocalCache, LocalCacheThread};
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "backend-http")]
     pub mod http {
         pub use crate::aio::http::{HttpReadOnly, HttpReadOnlyThread};
     }
@@ -352,7 +352,7 @@ impl Repo {
                         self.config.chunking.to_engine(),
                     );
 
-                    let mut data = util::EnumerateU64::new(chunker);
+                    let mut data = EnumerateU64::new(chunker);
 
                     while let Some(i_sg) =
                         timer.start_with("rx-and-chunking", || data.next())
@@ -360,8 +360,8 @@ impl Repo {
                         timer.start("tx");
                         let (i, sg) = i_sg;
                         process_tx
-                            .send(chunk_processor::Message {
-                                data: (i as u64, sg),
+                            .send(Message {
+                                data: (i, sg),
                                 response_tx: digests_tx.clone(),
                                 data_type,
                             })

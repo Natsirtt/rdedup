@@ -1,8 +1,9 @@
-use std::io;
-
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use chrono::prelude::*;
 use hex::{self, FromHex, FromHexError};
 use serde::Deserialize;
+use std::io;
 
 use crate::crypto::pwhash;
 use crate::{box_, secretbox};
@@ -63,7 +64,8 @@ where
     use serde::de::Error;
     String::deserialize(deserializer)
         .and_then(|string| {
-            base64::decode(&string)
+            STANDARD
+                .decode(&string)
                 .map_err(|err| Error::custom(err.to_string()))
         })
         .and_then(|ref bytes| {
@@ -78,7 +80,7 @@ where
     T: AsRef<[u8]>,
     S: serde::Serializer,
 {
-    serializer.serialize_str(&base64::encode(key.as_ref()))
+    serializer.serialize_str(&STANDARD.encode(key.as_ref()))
 }
 
 pub fn from_hex<'d, T, D>(deserializer: D) -> Result<T, D::Error>

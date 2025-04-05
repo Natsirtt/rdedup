@@ -95,12 +95,6 @@ dependencies = [
 
 [[package]]
 name = "base64"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "904dfeac50f3cdaba28fc6f57fdcddb75f49ed61346676a78c4ffe55877802fd"
-
-[[package]]
-name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -1215,7 +1209,7 @@ name = "rdedup-lib"
 version = "3.2.0"
 dependencies = [
  "backblaze-b2",
- "base64 0.13.0",
+ "base64 0.22.1",
  "blake2",
  "bytevec",
  "bzip2",

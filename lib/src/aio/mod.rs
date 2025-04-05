@@ -13,10 +13,14 @@ use slog::{o, trace};
 use slog::{Level, Logger};
 use slog_perf::TimeReporter;
 use url::Url;
-use crate::aio::http::HttpReadOnly;
 
 pub(crate) mod local;
 pub(crate) use self::local::Local;
+
+#[cfg(feature = "backend-http")]
+pub(crate) mod http;
+#[cfg(feature = "backend-http")]
+pub(crate) use self::http::HttpReadOnly;
 
 #[cfg(feature = "backend-b2")]
 pub(crate) mod b2;
@@ -25,7 +29,6 @@ pub(crate) use self::b2::B2;
 
 pub(crate) mod backend;
 pub(crate) mod local_cache;
-pub(crate) mod http;
 
 use self::backend::*;
 

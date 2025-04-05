@@ -1,5 +1,6 @@
 use crate::aio::Metadata;
 use crate::backends::{Backend, BackendThread, Lock};
+use reqwest::blocking::Client;
 use serde::Deserialize;
 use sgdata::SGData;
 use std::path::PathBuf;
@@ -29,21 +30,26 @@ struct FileInfo {
 
 pub struct HttpReadOnly {
     base_url: Url,
+    client: Client,
 }
 
 impl HttpReadOnly {
     pub fn new(base_url: Url) -> Self {
-        HttpReadOnly { base_url }
+        HttpReadOnly {
+            base_url,
+            client: Client::new(),
+        }
     }
 }
 
 pub struct HttpReadOnlyThread {
     base_url: Url,
+    client: Client,
 }
 
 impl HttpReadOnlyThread {
-    pub fn new(base_url: Url) -> Self {
-        HttpReadOnlyThread { base_url }
+    pub fn new(base_url: Url, client: Client) -> Self {
+        HttpReadOnlyThread { base_url, client }
     }
 
     fn get_endpoint(&self, path: PathBuf) -> Result<Url, io::Error> {
@@ -59,12 +65,15 @@ impl HttpReadOnlyThread {
         &self,
         path: PathBuf,
     ) -> io::Result<reqwest::blocking::Response> {
-        reqwest::blocking::get(self.get_endpoint(path)?).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                format!("Request failed: {:?}", e),
-            )
-        })
+        self.client
+            .get(self.get_endpoint(path)?)
+            .send()
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("Request failed: {:?}", e),
+                )
+            })
     }
 }
 
@@ -81,7 +90,10 @@ impl Backend for HttpReadOnly {
     }
 
     fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
-        Ok(Box::new(HttpReadOnlyThread::new(self.base_url.clone())))
+        Ok(Box::new(HttpReadOnlyThread::new(
+            self.base_url.clone(),
+            self.client.clone(),
+        )))
     }
 }
 

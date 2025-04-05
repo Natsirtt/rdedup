@@ -13,6 +13,7 @@ use slog::{o, trace};
 use slog::{Level, Logger};
 use slog_perf::TimeReporter;
 use url::Url;
+use crate::aio::http::HttpReadOnly;
 
 pub(crate) mod local;
 pub(crate) use self::local::Local;
@@ -24,6 +25,7 @@ pub(crate) use self::b2::B2;
 
 pub(crate) mod backend;
 pub(crate) mod local_cache;
+pub(crate) mod http;
 
 use self::backend::*;
 
@@ -631,6 +633,16 @@ pub(crate) fn backend_from_url(
 ) -> io::Result<Box<dyn Backend + Send + Sync>> {
     if url.scheme() == "file" {
         return Ok(Box::new(Local::new(url.to_file_path().unwrap())));
+    } else if url.scheme() == "http" || url.scheme() == "https" {
+        #[cfg(feature = "backend-http")]
+        {
+            return Ok(Box::new(HttpReadOnly::new(url.clone())));
+        }
+
+        #[cfg(not(feature = "backend-http"))]
+        {
+            panic!("HTTP backend feature is not enabled");
+        }
     } else if url.scheme() == "b2" {
         #[cfg(feature = "backend-b2")]
         {

@@ -76,6 +76,11 @@ pub mod backends {
         pub use crate::aio::local_cache::{LocalCache, LocalCacheThread};
     }
 
+    #[cfg(feature = "http")]
+    pub mod http {
+        pub use crate::aio::http::{HttpReadOnly, HttpReadOnlyThread};
+    }
+
     #[cfg(feature = "backend-b2")]
     pub mod b2 {
         pub use crate::aio::b2::{Auth, B2Thread, Lock, B2};

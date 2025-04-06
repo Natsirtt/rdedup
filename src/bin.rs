@@ -127,10 +127,10 @@ use url::Url;
 
 use crate::lib::settings;
 use crate::lib::Repo;
+use lib::backends::local::Local;
+use lib::backends::local_cache::LocalCache;
+use lib::backends::Backend;
 use rdedup_lib as lib;
-use rdedup_lib::backends::local::Local;
-use rdedup_lib::backends::local_cache::LocalCache;
-use rdedup_lib::backends::Backend;
 
 // Url parse with `io::Result` shortcut
 fn parse_url(s: &str) -> io::Result<Url> {
@@ -160,8 +160,8 @@ impl Options {
 
     fn set_encryption(&mut self, s: &str) {
         let encryption = match s {
-            "curve25519" => lib::settings::Encryption::Curve25519,
-            "none" => lib::settings::Encryption::None,
+            "curve25519" => settings::Encryption::Curve25519,
+            "none" => settings::Encryption::None,
             _ => {
                 eprintln!("unsupported encryption: {}", s);
                 process::exit(-1)
@@ -176,14 +176,14 @@ impl Options {
     fn set_compression(&mut self, s: &str) {
         let compression = match s {
             #[cfg(feature = "with-deflate")]
-            "deflate" => lib::settings::Compression::Deflate,
+            "deflate" => settings::Compression::Deflate,
             #[cfg(feature = "with-xz2")]
-            "xz2" => lib::settings::Compression::Xz2,
+            "xz2" => settings::Compression::Xz2,
             #[cfg(feature = "with-zstd")]
-            "zstd" => lib::settings::Compression::Zstd,
+            "zstd" => settings::Compression::Zstd,
             #[cfg(feature = "with-bzip2")]
-            "bzip2" => lib::settings::Compression::Bzip2,
-            "none" => lib::settings::Compression::None,
+            "bzip2" => settings::Compression::Bzip2,
+            "none" => settings::Compression::None,
             _ => {
                 eprintln!("unsupported compression: {}", s);
                 process::exit(-1)
@@ -220,11 +220,11 @@ impl Options {
         match s {
             "sha256" => self
                 .settings
-                .set_hashing(lib::settings::Hashing::Sha256)
+                .set_hashing(settings::Hashing::Sha256)
                 .expect("wrong hashing settings"),
             "blake2b" => self
                 .settings
-                .set_hashing(lib::settings::Hashing::Blake2b)
+                .set_hashing(settings::Hashing::Blake2b)
                 .expect("wrong hashing settings"),
             _ => {
                 eprintln!("unsupported hashing: {}", s);
@@ -482,7 +482,7 @@ enum Command {
 fn create_backend(
     options: &Options,
 ) -> io::Result<Box<dyn Backend + Send + Sync>> {
-    match rdedup_lib::backends::from_url(&options.url) {
+    match lib::backends::from_url(&options.url) {
         Ok(backend) => {
             if options.cache_dir.is_none() {
                 return Ok(backend);

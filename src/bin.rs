@@ -394,7 +394,7 @@ enum Command {
         #[clap(
             long,
             possible_values = &["curve25519", "none"],
-            default_value = "curve25519",
+            default_value = "none",
             value_name = "SCHEME",
         )]
         /// Set encryptiopn scheme

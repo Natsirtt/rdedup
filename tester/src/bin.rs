@@ -1,14 +1,13 @@
-use std::collections::HashMap;
-use std::default::Default;
-use std::io;
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::str::FromStr;
-
 use digest::Digest;
 use hex::ToHex;
 use rand::distributions::Standard;
 use rand::{rngs::SmallRng, thread_rng, Rng, SeedableRng};
+use std::collections::HashMap;
+use std::default::Default;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::str::FromStr;
+use std::{env, io};
 
 /// Generate data that has plenty of redundancy
 struct ExampleDataGen {
@@ -61,7 +60,7 @@ fn run_rdedup_with(args: &[&str], input: Vec<u8>) -> std::process::Output {
     let mut child = Command::new("target/release/rdedup")
         .args(args)
         .env("RDEDUP_PASSPHRASE", "foobar!@%!@#$!")
-        .env("RDEDUP_DIR", "/tmp/rdedup-tester")
+        .env("RDEDUP_DIR", env::temp_dir().join("rdedup"))
         .env("RUST_BACKTRACE", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -1,17 +1,17 @@
-use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::{Result, Write};
-use std::path;
-use std::path::PathBuf;
-use std::{self, fs};
-use std::{cmp, io};
-
 use crate::iterators::StoredChunks;
 use crate::settings;
 use crate::util::{ReaderVecIter, WhileOk};
 use hex;
 use rand::{self, Rng};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::{Result, Write};
+use std::path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::{self, fs};
+use std::{cmp, io};
 use url::Url;
 
 mod lib {
@@ -54,7 +54,8 @@ fn test_repo(pass: &str) -> lib::Repo {
     // Make it fasts to use
     settings.set_pwhash(settings::PWHash::Weak);
     let url = Url::from_file_path(rand_tmp_dir()).unwrap();
-    lib::Repo::init(&url, &|| Ok(pass.into()), settings, None).unwrap()
+    lib::Repo::init_from_url(Arc::new(url), &|| Ok(pass.into()), settings, None)
+        .unwrap()
 }
 
 fn test_repo_dir(pass: &str) -> (lib::Repo, PathBuf) {
@@ -64,7 +65,13 @@ fn test_repo_dir(pass: &str) -> (lib::Repo, PathBuf) {
     let dir = rand_tmp_dir();
     let url = Url::from_file_path(&dir).unwrap();
     (
-        lib::Repo::init(&url, &|| Ok(pass.into()), settings, None).unwrap(),
+        lib::Repo::init_from_url(
+            Arc::new(url),
+            &|| Ok(pass.into()),
+            settings,
+            None,
+        )
+        .unwrap(),
         dir,
     )
 }
@@ -265,8 +272,8 @@ fn change_passphrase() {
     {
         let mut settings = settings::Repo::new();
         settings.set_pwhash(settings::PWHash::Weak);
-        let repo = lib::Repo::init(
-            &Url::from_file_path(dir_path).unwrap(),
+        let repo = lib::Repo::init_from_url(
+            Arc::new(Url::from_file_path(dir_path).unwrap()),
             &|| Ok(prev_passphrase.into()),
             settings,
             None,
@@ -281,9 +288,11 @@ fn change_passphrase() {
     }
 
     for &p in &["a", "", "foo", "bar"] {
-        let mut repo =
-            lib::Repo::open(&Url::from_file_path(dir_path).unwrap(), None)
-                .unwrap();
+        let mut repo = lib::Repo::open_from_url(
+            Arc::new(Url::from_file_path(dir_path).unwrap()),
+            None,
+        )
+        .unwrap();
         repo.change_passphrase(
             &|| Ok(prev_passphrase.into()),
             &|| Ok(p.into()),
@@ -293,9 +302,11 @@ fn change_passphrase() {
     }
 
     {
-        let repo =
-            lib::Repo::open(&Url::from_directory_path(dir_path).unwrap(), None)
-                .unwrap();
+        let repo = lib::Repo::open_from_url(
+            Arc::new(Url::from_directory_path(dir_path).unwrap()),
+            None,
+        )
+        .unwrap();
         let dec_handle =
             repo.unlock_decrypt(&|| Ok(prev_passphrase.into())).unwrap();
         let mut data_after = vec![];
@@ -304,8 +315,11 @@ fn change_passphrase() {
         assert_eq!(data_before, data_after);
     }
 
-    let repo =
-        lib::Repo::open(&Url::from_file_path(dir_path).unwrap(), None).unwrap();
+    let repo = lib::Repo::open_from_url(
+        Arc::new(Url::from_file_path(dir_path).unwrap()),
+        None,
+    )
+    .unwrap();
     wipe(&repo);
 }
 
@@ -422,16 +436,16 @@ fn test_custom_chunking_size() {
                 panic!("expected Ok, but got {:}", result.err().unwrap());
             }
             settings.set_pwhash(settings::PWHash::Weak);
-            lib::Repo::init(
-                &Url::from_file_path(dir_path.clone()).unwrap(),
+            lib::Repo::init_from_url(
+                Arc::new(Url::from_file_path(dir_path.clone()).unwrap()),
                 &|| Ok(PASS.into()),
                 settings.clone(),
                 None,
             )
             .unwrap();
 
-            let repo = lib::Repo::open(
-                &Url::from_directory_path(dir_path).unwrap(),
+            let repo = lib::Repo::open_from_url(
+                Arc::new(Url::from_directory_path(dir_path).unwrap()),
                 None,
             )
             .unwrap();
@@ -462,17 +476,19 @@ fn test_custom_nesting() {
                 panic!("expected Ok, but got {:}", result.err().unwrap());
             }
             settings.set_pwhash(settings::PWHash::Weak);
-            lib::Repo::init(
-                &Url::from_file_path(dir_path.clone()).unwrap(),
+            lib::Repo::init_from_url(
+                Arc::new(Url::from_file_path(dir_path.clone()).unwrap()),
                 &|| Ok(PASS.into()),
                 settings.clone(),
                 None,
             )
             .unwrap();
 
-            let repo =
-                lib::Repo::open(&Url::from_file_path(dir_path).unwrap(), None)
-                    .unwrap();
+            let repo = lib::Repo::open_from_url(
+                Arc::new(Url::from_file_path(dir_path).unwrap()),
+                None,
+            )
+            .unwrap();
             assert_eq!(lib::config::Nesting(level), repo.config.nesting);
 
             // Test Store, Load, RM, and GC

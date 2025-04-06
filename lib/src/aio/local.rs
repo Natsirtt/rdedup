@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::{fs, io, mem};
 
 use fs2::FileExt;
-use rand::distributions::Alphanumeric;
+use rand::distr::Alphanumeric;
 use rand::Rng;
 use sgdata::SGData;
 use walkdir::WalkDir;
@@ -57,7 +57,7 @@ impl Backend for Local {
         Ok(Box::new(LocalThread {
             path: self.path.clone(),
             rand_ext: std::str::from_utf8(
-                &rand::thread_rng()
+                &rand::rng()
                     .sample_iter(&Alphanumeric)
                     .take(20)
                     .collect::<Vec<_>>()[..],

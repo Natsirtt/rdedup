@@ -107,14 +107,14 @@ impl Generation {
     pub(crate) fn gen_next(&self) -> Self {
         Generation {
             seq: self.seq + 1,
-            rand: rand::thread_rng().next_u64(),
+            rand: rand::rng().next_u64(),
         }
     }
 
     pub(crate) fn gen_first() -> Self {
         Generation {
             seq: 0,
-            rand: rand::thread_rng().next_u64(),
+            rand: rand::rng().next_u64(),
         }
     }
 

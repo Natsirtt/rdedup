@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{Result, Write};
-use std::path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{self, fs};
@@ -21,11 +20,11 @@ mod lib {
 const PASS: &'static str = "FOO";
 const DIGEST_SIZE: usize = 32;
 
-fn rand_tmp_dir() -> path::PathBuf {
+fn rand_tmp_dir() -> PathBuf {
     std::env::temp_dir().join("rdedup-tests").join(
         std::str::from_utf8(
-            &rand::thread_rng()
-                .sample_iter(&rand::distributions::Alphanumeric)
+            &rand::rng()
+                .sample_iter(&rand::distr::Alphanumeric)
                 .take(20)
                 .collect::<Vec<_>>()[..],
         )
@@ -43,7 +42,7 @@ fn list_stored_chunks(repo: &lib::Repo) -> Result<HashSet<Vec<u8>>> {
         repo.log.clone(),
     )?;
     for digest in data_chunks {
-        let digest = digest.unwrap();
+        let digest = digest?;
         digests.insert(digest);
     }
     Ok(digests)
@@ -110,13 +109,13 @@ fn copy_as_much_as_possible(dst: &mut [u8], src: &[u8]) -> usize {
 }
 
 impl io::Read for ExampleDataGen {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         if self.count == 0 {
             return Ok(0);
         }
         self.count -= 1;
 
-        let len = match rand::thread_rng().gen_range(0..3) {
+        let len = match rand::rng().random_range(0..3) {
             0 => copy_as_much_as_possible(buf, &self.a),
             1 => copy_as_much_as_possible(buf, &self.b),
             2 => copy_as_much_as_possible(buf, &self.c),
@@ -130,8 +129,8 @@ impl io::Read for ExampleDataGen {
 }
 
 fn rand_data(len: usize) -> Vec<u8> {
-    rand::thread_rng()
-        .sample_iter(&rand::distributions::Standard)
+    rand::rng()
+        .sample_iter(&rand::distr::StandardUniform)
         .take(len)
         .collect::<Vec<u8>>()
 }
@@ -207,7 +206,7 @@ fn random_sanity() {
 
     for i in 0..10 {
         let mut data =
-            ExampleDataGen::new(rand::thread_rng().gen_range(0..10 * 1024));
+            ExampleDataGen::new(rand::rng().random_range(0..10 * 1024));
         let name = format!("{:x}", i);
         repo.write(&name, &mut data, &enc_handle).unwrap();
         names.push((name, data.finish()));

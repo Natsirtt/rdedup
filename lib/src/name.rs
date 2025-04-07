@@ -19,6 +19,7 @@ pub(crate) struct Name {
     #[serde(serialize_with = "as_rfc3339", deserialize_with = "from_rfc3339")]
     /// The UTC timestamp when this `Name` was created.
     pub(crate) created: chrono::DateTime<chrono::Utc>,
+    pub(crate) size: u64,
 }
 
 // TODO: I am very displeased with myself how this
@@ -172,6 +173,44 @@ impl Name {
         }
 
         #[derive(Debug, Deserialize)]
+        /// Legacy version of `Name` missing `size` field
+        struct NameLegacyV4 {
+            #[serde(deserialize_with = "from_hex")]
+            digest: Vec<u8>,
+            index_level: u32,
+            #[serde(deserialize_with = "from_rfc3339")]
+            created: chrono::DateTime<chrono::Utc>,
+        }
+
+        if let Ok(NameLegacyV4 {
+            digest,
+            index_level,
+            created,
+        }) = serde_yaml::from_reader(config_data.as_slice())
+        {
+            let name = Name {
+                digest,
+                index_level,
+                created,
+                size: 0,
+            };
+            let is_serde_err = serde_yaml::to_string(&name)
+                .map(|serialized_str| {
+                    aio.write(
+                        path,
+                        SGData::from_single(serialized_str.into_bytes()),
+                    )
+                    .wait()
+                })
+                .is_err();
+            // re-write the `Name` configuration to include the new field.
+            if is_serde_err {
+                // FIXME: log the write error?
+            }
+            return Ok(name);
+        }
+
+        #[derive(Debug, Deserialize)]
         /// Legacy version of `Name` missing `created` field
         struct NameLegacyV3 {
             #[serde(deserialize_with = "from_hex")]
@@ -195,6 +234,7 @@ impl Name {
             digest,
             index_level,
             created,
+            size: 0,
         };
 
         let is_serde_err = serde_yaml::to_string(&name)
@@ -206,7 +246,7 @@ impl Name {
                 .wait()
             })
             .is_err();
-        // re-write the `Name` configuration to include the `created` field.
+        // re-write the `Name` configuration to include the new field.
         if is_serde_err {
             // FIXME: log the write error?
         }

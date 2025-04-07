@@ -1,7 +1,7 @@
 [package]
 name = "rdedup"
-version = "3.2.0"
-authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>"]
+version = "4.0.0-alpha"
+authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>", "Tristan Louet <tristan@louet.me>"]
 description = "Data deduplication with compression and public key encryption. - binary"
 keywords = ["data", "backup", "dedupliation", "encryption", "dedup"]
 license = "MPL-2.0"
@@ -43,15 +43,15 @@ lto = true
 debug-assertions = false
 
 [workspace]
-members = [ "tester" ]
+members = ["tester"]
 
 [dependencies]
 # Default features disabled so they can be explicitly opted into
 rdedup-lib = { version = "3.2.0", path = "lib", default-features = false }
-clap = { version = "3.1.0", features = [ "derive" ] }
+clap = { version = "3.1.0", features = ["derive"] }
 hex = "0.4.2"
 rpassword = "7.0"
-slog = { version = "2.0.10", features = ["max_level_trace", "release_max_level_trace"]}
+slog = { version = "2.0.10", features = ["max_level_trace", "release_max_level_trace"] }
 slog-term = "2"
 slog-async = "2"
 url = "2"

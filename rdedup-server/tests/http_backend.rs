@@ -147,6 +147,19 @@ async fn rdedup_http_backend_roundtrips_and_retries_names() {
         unauthorized_write.status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
+    assert_eq!(
+        unauthorized_write
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .unwrap(),
+        "application/problem+json"
+    );
+    let problem = unauthorized_write
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(problem["type"], "urn:rdedup:problem:unauthorized");
+    assert_eq!(problem["status"], 401);
     let unauthorized_exclusive_lease = client
         .post(endpoint.join("api/v1/leases").unwrap())
         .header("idempotency-key", uuid::Uuid::new_v4().to_string())

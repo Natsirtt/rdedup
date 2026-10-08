@@ -1,6 +1,6 @@
 use super::{Backend, BackendThread, Lock, Metadata};
 use reqwest::blocking::{Client, Response};
-use reqwest::header::IF_NONE_MATCH;
+use reqwest::header::{IF_NONE_MATCH, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use sgdata::SGData;
 use std::collections::HashMap;
@@ -12,15 +12,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum LeaseMode {
     Shared,
     Exclusive,
 }
 
+#[derive(Clone, Copy)]
+struct ActiveLease {
+    mode: LeaseMode,
+    expires_at_unix_ms: u128,
+    renewal_deadline_unix_ms: Option<u128>,
+}
+
 #[derive(Clone)]
 struct LeaseRegistry {
-    leases: Arc<Mutex<HashMap<Uuid, LeaseMode>>>,
+    leases: Arc<Mutex<HashMap<Uuid, ActiveLease>>>,
 }
 
 impl LeaseRegistry {
@@ -30,11 +38,19 @@ impl LeaseRegistry {
         }
     }
 
-    fn insert(&self, lease_id: Uuid, mode: LeaseMode) {
-        self.leases
-            .lock()
-            .expect("lease registry poisoned")
-            .insert(lease_id, mode);
+    fn insert(&self, lease_id: Uuid, lease: &LeaseResponse) {
+        self.leases.lock().expect("lease registry poisoned").insert(
+            lease_id,
+            ActiveLease {
+                mode: lease.mode,
+                expires_at_unix_ms: lease.expires_at_unix_ms,
+                renewal_deadline_unix_ms: lease.renewal_deadline_unix_ms,
+            },
+        );
+    }
+
+    fn renew(&self, lease_id: Uuid, lease: &LeaseResponse) {
+        self.insert(lease_id, lease);
     }
 
     fn remove(&self, lease_id: Uuid) {
@@ -45,25 +61,47 @@ impl LeaseRegistry {
     }
 
     fn lease_for(&self, required_mode: LeaseMode) -> io::Result<Uuid> {
-        self.leases
-            .lock()
-            .expect("lease registry poisoned")
-            .iter()
-            .find_map(|(lease_id, mode)| {
-                if required_mode == LeaseMode::Shared
-                    || *mode == LeaseMode::Exclusive
-                {
-                    Some(*lease_id)
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "no active rdedup HTTP lease",
-                )
-            })
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let leases = self.leases.lock().expect("lease registry poisoned");
+        let mut inactive_lease_error = None;
+        for (lease_id, lease) in &*leases {
+            if required_mode == LeaseMode::Exclusive
+                && lease.mode != LeaseMode::Exclusive
+            {
+                continue;
+            }
+            if lease
+                .renewal_deadline_unix_ms
+                .is_some_and(|deadline| now >= deadline)
+            {
+                inactive_lease_error = Some(lease_client_error(
+                    409,
+                    "urn:rdedup:problem:lease-renewal-closed",
+                    "the server has closed renewal for this lease; retry under a new lease",
+                ));
+                continue;
+            }
+            if now >= lease.expires_at_unix_ms {
+                inactive_lease_error = Some(lease_client_error(
+                    410,
+                    "urn:rdedup:problem:lease-expired",
+                    "the server lease has expired; retry under a new lease",
+                ));
+                continue;
+            }
+            return Ok(*lease_id);
+        }
+        if let Some(error) = inactive_lease_error {
+            Err(error)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no active rdedup HTTP lease",
+            ))
+        }
     }
 }
 
@@ -140,7 +178,7 @@ impl Http {
         };
 
         let lease_id = lease.lease_id;
-        self.registry.insert(lease_id, mode);
+        self.registry.insert(lease_id, &lease);
         Ok(Box::new(HttpLeaseGuard::new(
             lease_id,
             mode,
@@ -148,7 +186,7 @@ impl Http {
             self.client.clone(),
             self.token.clone(),
             self.registry.clone(),
-            lease.expires_at_unix_ms,
+            lease,
         )))
     }
 
@@ -259,15 +297,17 @@ impl HttpLeaseGuard {
         client: Client,
         token: Option<String>,
         registry: Arc<LeaseRegistry>,
-        expires_at_unix_ms: u128,
+        lease: LeaseResponse,
     ) -> Self {
         let (stop, stop_receiver) = mpsc::channel();
         let renewal_client = client.clone();
         let renewal_url = lease_url.clone();
         let renewal_token = token.clone();
+        let renewal_registry = registry.clone();
+        let renewal_lease_id = lease_id;
         let renew_thread = thread::spawn(move || {
             let mut next_renewal_interval =
-                renewal_interval(expires_at_unix_ms);
+                renewal_interval(lease.expires_at_unix_ms);
             loop {
                 match stop_receiver.recv_timeout(next_renewal_interval) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -286,6 +326,10 @@ impl HttpLeaseGuard {
                 let Ok(lease) = response.json::<LeaseResponse>() else {
                     break;
                 };
+                if lease.lease_id != renewal_lease_id {
+                    break;
+                }
+                renewal_registry.renew(renewal_lease_id, &lease);
                 next_renewal_interval =
                     renewal_interval(lease.expires_at_unix_ms);
             }
@@ -307,13 +351,13 @@ impl Lock for HttpLeaseGuard {}
 
 impl Drop for HttpLeaseGuard {
     fn drop(&mut self) {
-        self.registry.remove(self.lease_id);
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(renew_thread) = self.renew_thread.take() {
             let _ = renew_thread.join();
         }
+        self.registry.remove(self.lease_id);
         let mut request = self.client.delete(self.lease_url.clone());
         request = add_authorization(request, self.token.as_deref());
         let _ = request.send();
@@ -349,7 +393,9 @@ struct RequestStatusResponse {
 #[derive(Clone, Deserialize)]
 struct LeaseResponse {
     lease_id: Uuid,
+    mode: LeaseMode,
     expires_at_unix_ms: u128,
+    renewal_deadline_unix_ms: Option<u128>,
 }
 
 #[derive(Deserialize)]
@@ -486,19 +532,47 @@ impl BackendThread for HttpThread {
         idempotent: bool,
     ) -> io::Result<()> {
         let url = self.endpoint("objects", Some(&path))?;
-        let request =
-            self.request(reqwest::Method::PUT, url, LeaseMode::Shared)?;
-        let request = if idempotent {
-            request.header(IF_NONE_MATCH, "*")
-        } else {
-            request
-        };
         let mut body = Vec::with_capacity(sg.len());
         for part in sg.as_parts() {
             body.extend_from_slice(part);
         }
-        self.response(request.body(body).send().map_err(connection_error)?)?;
-        Ok(())
+        let maximum_attempts = if idempotent { 4 } else { 1 };
+        for attempt in 0..maximum_attempts {
+            let request = self.request(
+                reqwest::Method::PUT,
+                url.clone(),
+                LeaseMode::Shared,
+            )?;
+            let request = if idempotent {
+                request.header(IF_NONE_MATCH, "*")
+            } else {
+                request
+            };
+            match request.body(body.clone()).send() {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response)
+                    if idempotent
+                        && attempt + 1 < maximum_attempts
+                        && retryable_status(response.status().as_u16()) =>
+                {
+                    let delay = retry_delay(&response, attempt);
+                    drop(response);
+                    thread::sleep(delay);
+                }
+                Ok(response) => return Err(response_error(response)),
+                Err(error)
+                    if idempotent
+                        && attempt + 1 < maximum_attempts
+                        && (error.is_timeout() || error.is_connect()) =>
+                {
+                    thread::sleep(backoff_delay(attempt));
+                }
+                Err(error) => return Err(connection_error(error)),
+            }
+        }
+        Err(io::Error::other(
+            "idempotent HTTP write retry loop ended unexpectedly",
+        ))
     }
 
     fn read(&mut self, path: PathBuf) -> io::Result<SGData> {
@@ -593,16 +667,210 @@ fn invalid_response(error: reqwest::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 502 | 503 | 504)
+}
+
+fn backoff_delay(attempt: usize) -> Duration {
+    Duration::from_millis(250u64.saturating_mul(1 << attempt.min(3)))
+}
+
+fn retry_delay(response: &Response, attempt: usize) -> Duration {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| retry_after_delay(value, SystemTime::now()))
+        .unwrap_or_else(|| backoff_delay(attempt))
+}
+
+fn retry_after_delay(value: &str, now: SystemTime) -> Option<Duration> {
+    value
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .ok()
+        .or_else(|| {
+            httpdate::parse_http_date(value).ok().map(|retry_at| {
+                retry_at.duration_since(now).unwrap_or_default()
+            })
+        })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HttpBackendError {
+    #[error("HTTP {status} {title}: {detail} ({problem_type})")]
+    Problem {
+        status: u16,
+        problem_type: String,
+        title: String,
+        detail: String,
+    },
+    #[error("HTTP lease expired: {detail}")]
+    LeaseExpired { status: u16, detail: String },
+    #[error("HTTP lease renewal closed: {detail}")]
+    LeaseRenewalClosed { status: u16, detail: String },
+}
+
+impl HttpBackendError {
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Problem { status, .. }
+            | Self::LeaseExpired { status, .. }
+            | Self::LeaseRenewalClosed { status, .. } => *status,
+        }
+    }
+
+    pub fn problem_type(&self) -> &str {
+        match self {
+            Self::Problem { problem_type, .. } => problem_type,
+            Self::LeaseExpired { .. } => "urn:rdedup:problem:lease-expired",
+            Self::LeaseRenewalClosed { .. } => {
+                "urn:rdedup:problem:lease-renewal-closed"
+            }
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Problem { detail, .. }
+            | Self::LeaseExpired { detail, .. }
+            | Self::LeaseRenewalClosed { detail, .. } => detail,
+        }
+    }
+}
+
+fn lease_client_error(
+    status: u16,
+    problem_type: &str,
+    detail: &str,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        match problem_type {
+            "urn:rdedup:problem:lease-renewal-closed" => {
+                HttpBackendError::LeaseRenewalClosed {
+                    status,
+                    detail: detail.to_owned(),
+                }
+            }
+            _ => HttpBackendError::LeaseExpired {
+                status,
+                detail: detail.to_owned(),
+            },
+        },
+    )
+}
+
+#[derive(Deserialize)]
+struct ProblemDetails {
+    #[serde(rename = "type")]
+    problem_type: Option<String>,
+    title: Option<String>,
+    detail: Option<String>,
+}
+
 fn response_error(response: Response) -> io::Error {
     let status = response.status();
-    let message = response.text().unwrap_or_default();
-    let kind = match status.as_u16() {
-        400 => io::ErrorKind::InvalidInput,
-        401 | 403 => io::ErrorKind::PermissionDenied,
-        404 => io::ErrorKind::NotFound,
-        409 | 412 => io::ErrorKind::AlreadyExists,
-        410 => io::ErrorKind::TimedOut,
-        _ => io::ErrorKind::Other,
+    let body = response.text().unwrap_or_default();
+    problem_error(status.as_u16(), &body)
+}
+
+fn problem_error(status: u16, body: &str) -> io::Error {
+    let problem = serde_json::from_str::<ProblemDetails>(body).ok();
+    let problem_type = problem
+        .as_ref()
+        .and_then(|problem| problem.problem_type.clone())
+        .unwrap_or_else(|| "about:blank".to_owned());
+    let title = problem
+        .as_ref()
+        .and_then(|problem| problem.title.clone())
+        .unwrap_or_else(|| {
+            reqwest::StatusCode::from_u16(status)
+                .ok()
+                .and_then(|status| status.canonical_reason())
+                .unwrap_or("HTTP error")
+                .to_owned()
+        });
+    let detail = problem
+        .as_ref()
+        .and_then(|problem| problem.detail.clone())
+        .unwrap_or_else(|| body.to_owned());
+    let kind = match problem_type.as_str() {
+        "urn:rdedup:problem:lease-expired"
+        | "urn:rdedup:problem:lease-renewal-closed" => io::ErrorKind::TimedOut,
+        "urn:rdedup:problem:object-conflict"
+        | "urn:rdedup:problem:conflict" => io::ErrorKind::AlreadyExists,
+        _ => match status {
+            400 => io::ErrorKind::InvalidInput,
+            401 | 403 => io::ErrorKind::PermissionDenied,
+            404 => io::ErrorKind::NotFound,
+            410 => io::ErrorKind::TimedOut,
+            _ => io::ErrorKind::Other,
+        },
     };
-    io::Error::new(kind, format!("HTTP {status}: {message}"))
+    let source = match problem_type.as_str() {
+        "urn:rdedup:problem:lease-expired" => {
+            HttpBackendError::LeaseExpired { status, detail }
+        }
+        "urn:rdedup:problem:lease-renewal-closed" => {
+            HttpBackendError::LeaseRenewalClosed { status, detail }
+        }
+        _ => HttpBackendError::Problem {
+            status,
+            problem_type,
+            title,
+            detail,
+        },
+    };
+    io::Error::new(kind, source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        problem_error, retry_after_delay, retryable_status, HttpBackendError,
+    };
+    use std::io;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn server_problem_type_survives_as_typed_io_error_source() {
+        let error = problem_error(
+            409,
+            r#"{"type":"urn:rdedup:problem:lease-renewal-closed","title":"Conflict","status":409,"detail":"renewals are closed"}"#,
+        );
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<HttpBackendError>())
+            .unwrap();
+        assert_eq!(source.status(), 409);
+        assert_eq!(
+            source.problem_type(),
+            "urn:rdedup:problem:lease-renewal-closed"
+        );
+        assert_eq!(source.detail(), "renewals are closed");
+    }
+
+    #[test]
+    fn only_temporary_server_statuses_are_retryable() {
+        assert!(retryable_status(408));
+        assert!(retryable_status(429));
+        assert!(retryable_status(503));
+        assert!(!retryable_status(400));
+        assert!(!retryable_status(409));
+        assert!(!retryable_status(500));
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        assert_eq!(retry_after_delay("7", now), Some(Duration::from_secs(7)));
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(12));
+        assert_eq!(
+            retry_after_delay(&date, now),
+            Some(Duration::from_secs(12))
+        );
+    }
 }

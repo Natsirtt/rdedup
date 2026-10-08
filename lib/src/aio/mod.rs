@@ -232,17 +232,6 @@ impl AsyncIO {
             .expect("aio tx closed: write_checked");
     }
 
-    pub fn write_checked_idempotent(&self, path: PathBuf, sg: SGData) {
-        self.tx
-            .send(Message::Write(WriteArgs {
-                path,
-                data: sg,
-                idempotent: true,
-                complete_tx: None,
-            }))
-            .expect("aio tx closed: write_checked_idempotent");
-    }
-
     pub fn read(&self, path: PathBuf) -> AsyncIOResult<SGData> {
         let (tx, rx) = mpsc::channel();
         self.tx

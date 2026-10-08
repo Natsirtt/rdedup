@@ -1,5 +1,8 @@
 use std::io;
-use std::sync::mpsc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::{error, fmt};
 
 use sgdata::SGData;
 use slog::{trace, Level, Logger};
@@ -16,6 +19,31 @@ pub(crate) struct Message {
     pub data: (u64, SGData),
     pub data_type: DataType,
     pub response_tx: mpsc::Sender<(u64, Digest)>,
+    pub write_failure_tx: mpsc::Sender<ChunkWriteFailure>,
+    pub abort_pipeline: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChunkWriteFailure {
+    pub path: PathBuf,
+    pub source: io::Error,
+}
+
+impl fmt::Display for ChunkWriteFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "failed to write chunk {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl error::Error for ChunkWriteFailure {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 pub(crate) struct ChunkProcessor {
@@ -72,13 +100,21 @@ impl ChunkProcessor {
                 let Message {
                     data,
                     response_tx,
+                    write_failure_tx,
+                    abort_pipeline,
                     data_type,
                 } = input;
                 let (sg_id, sg) = data;
 
                 let digest = Digest(self.hasher.calculate_digest(&sg));
 
+                if abort_pipeline.load(Ordering::Acquire) {
+                    let _ = response_tx.send((sg_id, digest));
+                    continue;
+                }
+
                 let mut found = false;
+                let mut failed = false;
                 // lookup all generations in order, starting from current one
                 // and at the end try the current gen. again, in case some other
                 // thread/ instance just moved it from older generation to the
@@ -108,42 +144,55 @@ impl ChunkProcessor {
                                         digest.as_digest_ref(),
                                         gen_strings.last().unwrap(),
                                     );
-                                self.aio
+                                if let Err(rename_error) = self
+                                    .aio
                                     .rename(
                                         chunk_path.clone(),
                                         dst_path.clone(),
                                     )
                                     .wait()
-                                    .unwrap_or_else(|_e| {
-                                        // chunk might have been upated
-                                        // concurrently; check
-                                        // if it's already in the destination
-                                        if self
-                                            .aio
-                                            .read_metadata(dst_path.clone())
-                                            .wait()
-                                            .is_err()
+                                {
+                                    // Another writer may have moved the chunk
+                                    // concurrently; check the destination.
+                                    if let Err(destination_error) = self
+                                        .aio
+                                        .read_metadata(dst_path.clone())
+                                        .wait()
+                                    {
+                                        let error = if destination_error.kind()
+                                            == io::ErrorKind::NotFound
                                         {
-                                            panic!(
-                                                "rename failed {} -> {}",
-                                                chunk_path.display(),
-                                                dst_path.display()
-                                            )
-                                        }
-                                    });
+                                            rename_error
+                                        } else {
+                                            destination_error
+                                        };
+                                        report_failure(
+                                            &write_failure_tx,
+                                            &abort_pipeline,
+                                            dst_path,
+                                            error,
+                                        );
+                                        failed = true;
+                                    }
+                                }
                             }
                             break;
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => panic!(
-                            "read_metadata failed for {}, err: {}",
-                            chunk_path.display(),
-                            e
-                        ),
+                        Err(error) => {
+                            report_failure(
+                                &write_failure_tx,
+                                &abort_pipeline,
+                                chunk_path,
+                                error,
+                            );
+                            failed = true;
+                            break;
+                        }
                     }
                 }
 
-                if !found {
+                if !found && !failed {
                     let chunk_path = self.repo.chunk_rel_path_by_digest(
                         digest.as_digest_ref(),
                         gen_strings.last().unwrap(),
@@ -165,13 +214,20 @@ impl ChunkProcessor {
                     };
 
                     timer.start("tx-writer");
-                    self.aio.write_checked_idempotent(
-                        self.repo.chunk_rel_path_by_digest(
-                            digest.as_digest_ref(),
-                            &last_gen_str,
-                        ),
-                        sg,
+                    let write_path = self.repo.chunk_rel_path_by_digest(
+                        digest.as_digest_ref(),
+                        &last_gen_str,
                     );
+                    if let Err(error) =
+                        self.aio.write_idempotent(write_path.clone(), sg).wait()
+                    {
+                        report_failure(
+                            &write_failure_tx,
+                            &abort_pipeline,
+                            write_path,
+                            error,
+                        );
+                    }
                 }
                 timer.start("tx-digest");
                 response_tx
@@ -181,5 +237,91 @@ impl ChunkProcessor {
                 return;
             }
         }
+    }
+}
+
+fn report_failure(
+    failure_tx: &mpsc::Sender<ChunkWriteFailure>,
+    abort_pipeline: &AtomicBool,
+    path: PathBuf,
+    source: io::Error,
+) {
+    if is_lease_interruption(&source) {
+        abort_pipeline.store(true, Ordering::Release);
+    }
+    let _ = failure_tx.send(ChunkWriteFailure { path, source });
+}
+
+#[cfg(feature = "backend-http")]
+fn is_lease_interruption(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| {
+            source.downcast_ref::<crate::backends::http::HttpBackendError>()
+        })
+        .is_some_and(|source| {
+            matches!(
+                source.problem_type(),
+                "urn:rdedup:problem:lease-expired"
+                    | "urn:rdedup:problem:lease-renewal-closed"
+            )
+        })
+}
+
+#[cfg(not(feature = "backend-http"))]
+fn is_lease_interruption(_error: &io::Error) -> bool {
+    false
+}
+
+#[cfg(all(test, feature = "backend-http"))]
+mod tests {
+    use super::{report_failure, ChunkWriteFailure};
+    use crate::backends::http::HttpBackendError;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    #[test]
+    fn lease_interruption_stops_reading_and_queuing_more_chunks() {
+        let (failure_tx, failure_rx) = mpsc::channel::<ChunkWriteFailure>();
+        let abort_pipeline = Arc::new(AtomicBool::new(false));
+        let error = io::Error::new(
+            io::ErrorKind::TimedOut,
+            HttpBackendError::LeaseExpired {
+                status: 410,
+                detail: "lease expired".to_owned(),
+            },
+        );
+
+        report_failure(
+            &failure_tx,
+            &abort_pipeline,
+            PathBuf::from("chunk-path"),
+            error,
+        );
+
+        assert!(abort_pipeline.load(Ordering::Acquire));
+        assert_eq!(
+            failure_rx.recv().unwrap().path,
+            PathBuf::from("chunk-path")
+        );
+    }
+
+    #[test]
+    fn ordinary_chunk_failure_does_not_stop_other_chunk_writes() {
+        let (failure_tx, failure_rx) = mpsc::channel::<ChunkWriteFailure>();
+        let abort_pipeline = Arc::new(AtomicBool::new(false));
+        let error = io::Error::other("temporary storage failure");
+
+        report_failure(
+            &failure_tx,
+            &abort_pipeline,
+            PathBuf::from("chunk-path"),
+            error,
+        );
+
+        assert!(!abort_pipeline.load(Ordering::Acquire));
+        assert!(failure_rx.recv().is_ok());
     }
 }

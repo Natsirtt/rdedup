@@ -4,6 +4,7 @@ use std::io;
 use std::io::{Error, Read, Result, Write};
 use std::iter::Iterator;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use sgdata::SGData;
@@ -78,7 +79,7 @@ pub mod backends {
 
     #[cfg(feature = "backend-http")]
     pub mod http {
-        pub use crate::aio::http::Http;
+        pub use crate::aio::http::{Http, HttpBackendError};
     }
 
     #[cfg(feature = "backend-b2")]
@@ -313,6 +314,10 @@ impl Repo {
         &'a self,
         input_data_iter: Box<dyn Iterator<Item = Vec<u8>> + Send + 'a>,
         process_tx: crossbeam_channel::Sender<chunk_processor::Message>,
+        write_failure_tx: std::sync::mpsc::Sender<
+            chunk_processor::ChunkWriteFailure,
+        >,
+        abort_pipeline: Arc<AtomicBool>,
         aio: aio::AsyncIO,
         data_type: DataType,
     ) -> io::Result<DataAddress> {
@@ -338,6 +343,8 @@ impl Repo {
 
             scope.spawn({
                 let process_tx = process_tx.clone();
+                let write_failure_tx = write_failure_tx.clone();
+                let abort_pipeline = abort_pipeline.clone();
                 move |_| {
                     let mut timer = slog_perf::TimeReporter::new_with_level(
                         "chunker",
@@ -361,6 +368,8 @@ impl Repo {
                             .send(Message {
                                 data: (i, sg),
                                 response_tx: digests_tx.clone(),
+                                write_failure_tx: write_failure_tx.clone(),
+                                abort_pipeline: abort_pipeline.clone(),
                                 data_type,
                             })
                             .expect("chunk process tx channel closed")
@@ -388,6 +397,8 @@ impl Repo {
                             .map(|digest| digest.0),
                     ),
                     process_tx,
+                    write_failure_tx,
+                    abort_pipeline,
                     aio.clone(),
                     DataType::Index,
                 )?;
@@ -414,6 +425,7 @@ impl Repo {
         &self,
         reader: R,
         chunker_tx: mpsc::SyncSender<Vec<u8>>,
+        abort_pipeline: Arc<AtomicBool>,
     ) where
         R: Read + Send,
     {
@@ -426,7 +438,10 @@ impl Repo {
         let r2vi = ReaderVecIter::new(reader, INGRESS_BUFFER_SIZE);
         let mut while_ok = WhileOk::new(r2vi);
 
-        while let Some(buf) = time.start_with("input", || while_ok.next()) {
+        while !abort_pipeline.load(Ordering::Acquire) {
+            let Some(buf) = time.start_with("input", || while_ok.next()) else {
+                break;
+            };
             time.start("tx");
             chunker_tx.send(buf).expect("chunker tx channel closed")
         }
@@ -857,9 +872,16 @@ impl Repo {
 
         // mpmc queue used  as spmc fan-out
         let (process_tx, process_rx) = crossbeam_channel::bounded(num_threads);
+        let (write_failure_tx, write_failure_rx) = std::sync::mpsc::channel();
+        let abort_pipeline = Arc::new(AtomicBool::new(false));
 
         let data_address = crossbeam::scope(|scope| {
-            scope.spawn(move |_| self.input_reader_thread(reader, chunker_tx));
+            scope.spawn({
+                let abort_pipeline = abort_pipeline.clone();
+                move |_| {
+                    self.input_reader_thread(reader, chunker_tx, abort_pipeline)
+                }
+            });
 
             for _ in 0..num_threads {
                 let process_rx = process_rx.clone();
@@ -887,6 +909,8 @@ impl Repo {
                 self.chunk_and_write_data_thread(
                     Box::new(chunker_rx.into_iter()),
                     process_tx,
+                    write_failure_tx,
+                    abort_pipeline,
                     aio,
                     DataType::Data,
                 )
@@ -904,6 +928,10 @@ impl Repo {
             }
         })?;
 
+        if let Some(error) = write_failure_rx.into_iter().next() {
+            return Err(io::Error::new(error.source.kind(), error));
+        }
+
         let name: Name = data_address?.into();
         name.write_as(name_str, *generations.last().unwrap(), &self.aio)?;
         Ok(stats.get_stats())
@@ -913,5 +941,8 @@ impl Repo {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod chunk_write_failure_tests;
 
 // vim: foldmethod=marker foldmarker={{{,}}}

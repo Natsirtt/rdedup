@@ -255,12 +255,16 @@ fn validate_lease(
 
 fn lease_error(error: LeaseError) -> ApiFailure {
     match error {
-        LeaseError::Gone => {
-            ApiFailure::new(StatusCode::GONE, error.to_string())
-        }
-        LeaseError::RenewalClosed => {
-            ApiFailure::new(StatusCode::CONFLICT, error.to_string())
-        }
+        LeaseError::Gone => ApiFailure::with_type(
+            StatusCode::GONE,
+            "urn:rdedup:problem:lease-expired",
+            error.to_string(),
+        ),
+        LeaseError::RenewalClosed => ApiFailure::with_type(
+            StatusCode::CONFLICT,
+            "urn:rdedup:problem:lease-renewal-closed",
+            error.to_string(),
+        ),
         LeaseError::RequestNotFound => {
             ApiFailure::new(StatusCode::NOT_FOUND, error.to_string())
         }
@@ -329,7 +333,16 @@ fn io_failure(error: io::Error) -> ApiFailure {
         io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    ApiFailure::new(status, error.to_string())
+    let problem_type = match error.kind() {
+        io::ErrorKind::NotFound => "urn:rdedup:problem:not-found",
+        io::ErrorKind::AlreadyExists => "urn:rdedup:problem:object-conflict",
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
+            "urn:rdedup:problem:invalid-request"
+        }
+        io::ErrorKind::PermissionDenied => "urn:rdedup:problem:forbidden",
+        _ => "urn:rdedup:problem:storage-failure",
+    };
+    ApiFailure::with_type(status, problem_type, error.to_string())
 }
 
 fn io_error(error: io::Error) -> Response {
@@ -339,6 +352,7 @@ fn io_error(error: io::Error) -> Response {
 #[derive(Debug)]
 struct ApiFailure {
     status: StatusCode,
+    problem_type: &'static str,
     message: String,
 }
 
@@ -346,6 +360,31 @@ impl ApiFailure {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         ApiFailure {
             status,
+            problem_type: match status {
+                StatusCode::UNAUTHORIZED => "urn:rdedup:problem:unauthorized",
+                StatusCode::FORBIDDEN => "urn:rdedup:problem:forbidden",
+                StatusCode::NOT_FOUND => "urn:rdedup:problem:not-found",
+                StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
+                    "urn:rdedup:problem:conflict"
+                }
+                StatusCode::GONE => "urn:rdedup:problem:gone",
+                StatusCode::PAYLOAD_TOO_LARGE => {
+                    "urn:rdedup:problem:payload-too-large"
+                }
+                _ => "urn:rdedup:problem:invalid-request",
+            },
+            message: message.into(),
+        }
+    }
+
+    fn with_type(
+        status: StatusCode,
+        problem_type: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        ApiFailure {
+            status,
+            problem_type,
             message: message.into(),
         }
     }
@@ -353,7 +392,29 @@ impl ApiFailure {
 
 impl IntoResponse for ApiFailure {
     fn into_response(self) -> Response {
-        (self.status, self.message).into_response()
+        #[derive(Serialize)]
+        struct ProblemDetails {
+            #[serde(rename = "type")]
+            problem_type: &'static str,
+            title: &'static str,
+            status: u16,
+            detail: String,
+        }
+
+        let title = self.status.canonical_reason().unwrap_or("Request failed");
+        let mut response = (
+            self.status,
+            [(header::CONTENT_TYPE, "application/problem+json")],
+            Json(ProblemDetails {
+                problem_type: self.problem_type,
+                title,
+                status: self.status.as_u16(),
+                detail: self.message,
+            }),
+        )
+            .into_response();
+        *response.status_mut() = self.status;
+        response
     }
 }
 
@@ -415,7 +476,11 @@ async fn write_object(
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|length| length > MAX_OBJECT_SIZE)
     {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        return ApiFailure::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "object exceeds the maximum size",
+        )
+        .into_response();
     }
     let body = match read_body_under_lease(
         request.into_body(),
@@ -715,11 +780,11 @@ async fn acquire_lease(
         "shared" => LeaseMode::Shared,
         "exclusive" => LeaseMode::Exclusive,
         _ => {
-            return (
+            return ApiFailure::new(
                 StatusCode::BAD_REQUEST,
                 "lease mode must be shared or exclusive",
             )
-                .into_response()
+            .into_response()
         }
     };
     if mode == LeaseMode::Exclusive {
@@ -734,8 +799,11 @@ async fn acquire_lease(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty() && value.len() <= 128)
     else {
-        return (StatusCode::BAD_REQUEST, "missing idempotency-key")
-            .into_response();
+        return ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "missing idempotency-key",
+        )
+        .into_response();
     };
     match state.leases.acquire(mode, key.to_owned()) {
         AcquireResult::Granted(grant) => {
@@ -765,7 +833,8 @@ async fn lease_request_status(
     headers: HeaderMap,
 ) -> Response {
     let Ok(request_id) = Uuid::parse_str(&request_id) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return ApiFailure::new(StatusCode::BAD_REQUEST, "invalid request id")
+            .into_response();
     };
     let mode = match state.leases.request_mode(request_id) {
         Ok(mode) => mode,
@@ -797,7 +866,12 @@ async fn lease_request_status(
             }),
         )
             .into_response(),
-        Ok(RequestStatus::Gone) => StatusCode::GONE.into_response(),
+        Ok(RequestStatus::Gone) => ApiFailure::with_type(
+            StatusCode::GONE,
+            "urn:rdedup:problem:lease-request-expired",
+            "lease request expired before it was granted",
+        )
+        .into_response(),
         Err(error) => lease_error(error).into_response(),
     }
 }
@@ -808,7 +882,8 @@ async fn cancel_lease_request(
     headers: HeaderMap,
 ) -> Response {
     let Ok(request_id) = Uuid::parse_str(&request_id) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return ApiFailure::new(StatusCode::BAD_REQUEST, "invalid request id")
+            .into_response();
     };
     let mode = match state.leases.request_mode(request_id) {
         Ok(mode) => mode,
@@ -829,7 +904,8 @@ async fn renew_lease(
     headers: HeaderMap,
 ) -> Response {
     let Ok(lease_id) = Uuid::parse_str(&lease_id) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return ApiFailure::new(StatusCode::BAD_REQUEST, "invalid lease id")
+            .into_response();
     };
     let mode = match state.leases.lease_mode(lease_id) {
         Ok(mode) => mode,
@@ -850,7 +926,8 @@ async fn release_lease(
     headers: HeaderMap,
 ) -> Response {
     let Ok(lease_id) = Uuid::parse_str(&lease_id) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return ApiFailure::new(StatusCode::BAD_REQUEST, "invalid lease id")
+            .into_response();
     };
     let mode = match state.leases.lease_mode(lease_id) {
         Ok(mode) => mode,

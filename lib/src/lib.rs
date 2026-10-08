@@ -78,7 +78,7 @@ pub mod backends {
 
     #[cfg(feature = "backend-http")]
     pub mod http {
-        pub use crate::aio::http::{HttpReadOnly, HttpReadOnlyThread};
+        pub use crate::aio::http::Http;
     }
 
     #[cfg(feature = "backend-b2")]
@@ -269,6 +269,7 @@ impl Repo {
         let backend = backend_select()?;
         let aio = aio::AsyncIO::new(backend, log.clone())?;
 
+        let _lock = aio.lock_shared()?;
         let config = config::Repo::read(&aio)?;
 
         let compression = config.compression.to_engine();

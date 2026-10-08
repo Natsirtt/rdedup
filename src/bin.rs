@@ -356,6 +356,12 @@ struct CliOpts {
 #[derive(Debug, Subcommand)]
 #[clap(setting = clap::AppSettings::DeriveDisplayOrder)]
 enum Command {
+    /// Serve a repository over the authenticated rdedup HTTP protocol
+    Serve {
+        #[clap(long, value_name = "PATH")]
+        /// Load server settings from this TOML file
+        config: Option<PathBuf>,
+    },
     #[clap(setting = clap::AppSettings::DeriveDisplayOrder)]
     /// Create a new repository
     Init {
@@ -500,6 +506,13 @@ fn create_backend(
 fn run() -> io::Result<()> {
     let cli_opts = CliOpts::parse();
 
+    if let Command::Serve { config } = &cli_opts.command {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(rdedup_server::run(config.clone()));
+    }
+
     let url: Url = if let Some(loc) = cli_opts.repo_uri {
         let s = loc.into_string().map_err(|_| {
             io::Error::new(
@@ -556,6 +569,9 @@ fn run() -> io::Result<()> {
         create_logger(cli_opts.verbose as u32, cli_opts.verbose_timings as u32);
 
     match cli_opts.command {
+        Command::Serve { .. } => {
+            unreachable!("serve is handled before repository selection")
+        }
         Command::Init {
             chunking,
             chunk_size,

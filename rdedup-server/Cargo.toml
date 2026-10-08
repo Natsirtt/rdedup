@@ -1,0 +1,26 @@
+[package]
+name = "rdedup-server"
+version = "3.2.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "HTTP server for rdedup repositories"
+
+[dependencies]
+axum = "0.8"
+futures-util = "0.3"
+rdedup-lib = { path = "../lib", default-features = false }
+sgdata = { path = "../sgdata" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+rdedup-lib = { path = "../lib", default-features = false, features = ["backend-http"] }
+url = "2"

@@ -139,7 +139,6 @@ impl Name {
     ) -> io::Result<()> {
         let serialized_str =
             serde_yaml::to_string(self).expect("yaml serialization failed");
-
         let path = Name::path(name, gen);
 
         if let Err(error) = aio
@@ -154,7 +153,7 @@ impl Name {
             }
         }
 
-        let existing = Name::try_deserialize(name, gen, aio)?;
+        let existing = Self::try_deserialize(name, gen, aio)?;
         if self.digest == existing.digest
             && self.index_level == existing.index_level
         {

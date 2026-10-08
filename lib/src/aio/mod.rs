@@ -20,7 +20,7 @@ pub(crate) use self::local::Local;
 #[cfg(feature = "backend-http")]
 pub(crate) mod http;
 #[cfg(feature = "backend-http")]
-pub(crate) use self::http::HttpReadOnly;
+pub(crate) use self::http::Http;
 
 #[cfg(feature = "backend-b2")]
 pub(crate) mod b2;
@@ -635,12 +635,15 @@ pub(crate) fn backend_from_url(
     } else if url.scheme() == "http" || url.scheme() == "https" {
         #[cfg(feature = "backend-http")]
         {
-            return Ok(Box::new(HttpReadOnly::new(url.clone())));
+            return Ok(Box::new(Http::new(url.clone())));
         }
 
         #[cfg(not(feature = "backend-http"))]
         {
-            panic!("HTTP backend feature is not enabled");
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "HTTP backend feature is not enabled",
+            ));
         }
     } else if url.scheme() == "b2" {
         #[cfg(feature = "backend-b2")]

@@ -114,6 +114,9 @@ Supported commands:
 * `rdedup rm <name>` - remove the given *name*.
 * `rdedup ls` - list all stored names.
 * `rdedup gc` - remove any no longer reachable data.
+* `rdedup serve` - expose a repository through the writable HTTP backend. The
+  server uses plain HTTP and must sit behind a trusted TLS reverse proxy; see
+  [`rdedup-server/README.md`](rdedup-server/README.md).
 
 
 In combination with [rdup][rdup] this can be used to store and restore your

@@ -563,16 +563,21 @@ impl lib::backends::Backend for FailingLockBackend {
     }
 }
 
-#[test]
-fn shared_repository_operations_fail_when_the_lock_cannot_be_acquired() {
-    let (repository, repository_path) = test_repo_dir(PASS);
-    drop(repository);
+fn repo_with_failing_locks() -> lib::Repo {
+    let repository_path = rand_tmp_dir();
     let backend = Arc::new(move || {
         Ok(Box::new(FailingLockBackend {
             repository_path: repository_path.clone(),
         }) as Box<dyn lib::backends::Backend + Send + Sync>)
     });
-    let repository = lib::Repo::open(backend, None).unwrap();
+    let mut settings = settings::Repo::new();
+    settings.set_pwhash(settings::PWHash::Weak);
+    lib::Repo::init(backend, &|| Ok(PASS.into()), settings, None).unwrap()
+}
+
+#[test]
+fn shared_repository_operations_fail_when_the_lock_cannot_be_acquired() {
+    let repository = repo_with_failing_locks();
 
     let error = match repository.list_names() {
         Err(error) => error,
@@ -583,14 +588,7 @@ fn shared_repository_operations_fail_when_the_lock_cannot_be_acquired() {
 
 #[test]
 fn exclusive_repository_operations_fail_when_the_lock_cannot_be_acquired() {
-    let (repository, repository_path) = test_repo_dir(PASS);
-    drop(repository);
-    let backend = Arc::new(move || {
-        Ok(Box::new(FailingLockBackend {
-            repository_path: repository_path.clone(),
-        }) as Box<dyn lib::backends::Backend + Send + Sync>)
-    });
-    let repository = lib::Repo::open(backend, None).unwrap();
+    let repository = repo_with_failing_locks();
 
     let error = match repository.rm("missing") {
         Err(error) => error,

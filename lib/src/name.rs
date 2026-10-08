@@ -142,16 +142,29 @@ impl Name {
 
         let path = Name::path(name, gen);
 
-        if aio.read(path.clone()).wait().is_ok() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "name already exists",
-            ));
+        if let Err(error) = aio
+            .write_idempotent(
+                path,
+                SGData::from_single(serialized_str.into_bytes()),
+            )
+            .wait()
+        {
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
         }
 
-        aio.write(path, SGData::from_single(serialized_str.into_bytes()))
-            .wait()?;
-        Ok(())
+        let existing = Name::try_deserialize(name, gen, aio)?;
+        if self.digest == existing.digest
+            && self.index_level == existing.index_level
+        {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "name already exists with different contents",
+            ))
+        }
     }
 
     /// Attempts to deserialize `path` as a `Name`. For backwards compatibility,

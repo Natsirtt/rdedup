@@ -289,7 +289,7 @@ impl Repo {
         old_p: PassphraseFn<'_>,
         new_p: PassphraseFn<'_>,
     ) -> Result<()> {
-        let _lock = self.aio.lock_exclusive();
+        let _lock = self.aio.lock_exclusive()?;
 
         if self.config.version == 0 {
             Err(Error::new(
@@ -628,18 +628,18 @@ impl Repo {
     }
 
     pub fn list_names(&self) -> io::Result<Vec<String>> {
-        let _lock = self.aio.lock_shared();
+        let _lock = self.aio.lock_shared()?;
         Name::list_all(&self.read_generations()?, &self.aio)
     }
 
     /// Remove a stored name from repo
     pub fn rm(&self, name: &str) -> Result<()> {
-        let _lock = self.aio.lock_exclusive();
+        let _lock = self.aio.lock_exclusive()?;
         Name::remove_any(name, &self.read_generations()?, &self.aio)
     }
 
     pub fn gc(&self, min_age_secs: u64) -> Result<()> {
-        let _lock = self.aio.lock_exclusive();
+        let _lock = self.aio.lock_exclusive()?;
 
         let generations = self.read_generations()?;
 
@@ -696,7 +696,7 @@ impl Repo {
         writer: &mut W,
         dec: &DecryptHandle,
     ) -> Result<()> {
-        let _lock = self.aio.lock_shared();
+        let _lock = self.aio.lock_shared()?;
 
         let generations = self.read_generations()?;
 
@@ -718,7 +718,7 @@ impl Repo {
     }
 
     pub fn du(&self, name_str: &str, dec: &DecryptHandle) -> Result<DuResults> {
-        let _lock = self.aio.lock_shared();
+        let _lock = self.aio.lock_shared()?;
 
         let generations = self.read_generations()?;
         let name = Name::load_from_any(name_str, &generations, &self.aio)?;
@@ -751,7 +751,7 @@ impl Repo {
         name_str: &str,
         dec: &DecryptHandle,
     ) -> Result<VerifyResults> {
-        let _lock = self.aio.lock_shared();
+        let _lock = self.aio.lock_shared()?;
 
         let generations = self.read_generations()?;
 
@@ -829,7 +829,7 @@ impl Repo {
         R: Read + Send,
     {
         info!(self.log, "Writing data"; "name" => name_str);
-        let _lock = self.aio.lock_shared();
+        let _lock = self.aio.lock_shared()?;
 
         let mut generations = self.read_generations()?;
 
@@ -899,7 +899,7 @@ impl Repo {
             if let Some(io_e) = e.downcast_ref::<io::Error>() {
                 io::Error::new(io_e.kind(), format!("{}", io_e))
             } else {
-                io::Error::new(io::ErrorKind::Other, format!("{:?}", e))
+                io::Error::other(format!("{:?}", e))
             }
         })?;
 

@@ -124,7 +124,24 @@ impl BackendThread for LocalThread {
         }
 
         chunk_file.sync_data()?;
-        fs::rename(&tmp_path, &path)?;
+        drop(chunk_file);
+
+        if idempotent {
+            match fs::hard_link(&tmp_path, &path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&tmp_path);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&tmp_path);
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+            }
+        } else {
+            fs::rename(&tmp_path, &path)?;
+        }
 
         Ok(())
     }
@@ -160,9 +177,10 @@ impl BackendThread for LocalThread {
         } else if let Ok(modified) = md.modified().map(Into::into) {
             modified
         } else {
-            return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("filesystem metadata does not contain `created` or `modified` for {}", path.display())));
+            return Err(io::Error::other(format!(
+                "filesystem metadata does not contain `created` or `modified` for {}",
+                path.display()
+            )));
         };
         Ok(Metadata {
             len: md.len(),

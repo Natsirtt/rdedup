@@ -445,14 +445,10 @@ impl AsyncIOThread {
             let mut sh = self.shared.inner.lock().unwrap();
 
             if sh.in_progress.contains(&path) {
-                if idempotent {
-                    return Ok(());
-                } else {
-                    // a bit lame, but will do, since this should not really
-                    // happen in practice anyway
-                    drop(sh);
-                    thread::sleep(std::time::Duration::from_millis(1000));
-                }
+                // A completed write must be visible before an idempotent
+                // caller can decide that the existing value is equivalent.
+                drop(sh);
+                thread::sleep(std::time::Duration::from_millis(100));
             } else {
                 sh.in_progress.insert(path.clone());
                 break;

@@ -142,11 +142,17 @@ impl Name {
 
         let path = Name::path(name, gen);
 
-        aio.write_idempotent(
-            path,
-            SGData::from_single(serialized_str.into_bytes()),
-        )
-        .wait()?;
+        if let Err(error) = aio
+            .write_idempotent(
+                path,
+                SGData::from_single(serialized_str.into_bytes()),
+            )
+            .wait()
+        {
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
 
         let existing = Name::try_deserialize(name, gen, aio)?;
         if self.digest == existing.digest

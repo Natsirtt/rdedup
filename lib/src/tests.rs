@@ -537,3 +537,115 @@ fn test_readerveciter() {
     assert_eq!(v, [vec![0, 1]]);
     assert!(while_ok.finish().is_some());
 }
+
+struct FailingLockBackend {
+    repository_path: PathBuf,
+}
+
+impl lib::backends::Backend for FailingLockBackend {
+    fn lock_exclusive(&self) -> io::Result<Box<dyn lib::backends::Lock>> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lock denied",
+        ))
+    }
+
+    fn lock_shared(&self) -> io::Result<Box<dyn lib::backends::Lock>> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lock denied",
+        ))
+    }
+
+    fn new_thread(&self) -> io::Result<Box<dyn lib::backends::BackendThread>> {
+        lib::backends::local::Local::new(self.repository_path.clone())
+            .new_thread()
+    }
+}
+
+#[test]
+fn shared_repository_operations_fail_when_the_lock_cannot_be_acquired() {
+    let (repository, repository_path) = test_repo_dir(PASS);
+    drop(repository);
+    let backend = Arc::new(move || {
+        Ok(Box::new(FailingLockBackend {
+            repository_path: repository_path.clone(),
+        }) as Box<dyn lib::backends::Backend + Send + Sync>)
+    });
+    let repository = lib::Repo::open(backend, None).unwrap();
+
+    let error = match repository.list_names() {
+        Err(error) => error,
+        Ok(names) => panic!("listing unexpectedly succeeded: {names:?}"),
+    };
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn exclusive_repository_operations_fail_when_the_lock_cannot_be_acquired() {
+    let (repository, repository_path) = test_repo_dir(PASS);
+    drop(repository);
+    let backend = Arc::new(move || {
+        Ok(Box::new(FailingLockBackend {
+            repository_path: repository_path.clone(),
+        }) as Box<dyn lib::backends::Backend + Send + Sync>)
+    });
+    let repository = lib::Repo::open(backend, None).unwrap();
+
+    let error = match repository.rm("missing") {
+        Err(error) => error,
+        Ok(()) => panic!("remove unexpectedly succeeded"),
+    };
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn retrying_a_name_write_with_the_same_contents_succeeds() {
+    let repository = test_repo(PASS);
+    let encryption = repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+    let data = b"retry-safe archive contents";
+
+    repository
+        .write("archive", &mut io::Cursor::new(data), &encryption)
+        .unwrap();
+    repository
+        .write("archive", &mut io::Cursor::new(data), &encryption)
+        .expect("retrying the same name and contents should succeed");
+
+    let mut stored_data = Vec::new();
+    let decryption = repository.unlock_decrypt(&|| Ok(PASS.into())).unwrap();
+    repository
+        .read("archive", &mut stored_data, &decryption)
+        .unwrap();
+    assert_eq!(stored_data, data);
+
+    wipe(&repository);
+}
+
+#[test]
+fn conflicting_name_write_preserves_the_original_contents() {
+    let repository = test_repo(PASS);
+    let encryption = repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+    let original_data = b"original archive contents";
+
+    repository
+        .write("archive", &mut io::Cursor::new(original_data), &encryption)
+        .unwrap();
+    let error = repository
+        .write(
+            "archive",
+            &mut io::Cursor::new(b"different archive contents"),
+            &encryption,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+    let mut stored_data = Vec::new();
+    let decryption = repository.unlock_decrypt(&|| Ok(PASS.into())).unwrap();
+    repository
+        .read("archive", &mut stored_data, &decryption)
+        .unwrap();
+    assert_eq!(stored_data, original_data);
+
+    wipe(&repository);
+}

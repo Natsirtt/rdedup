@@ -47,38 +47,32 @@ impl Iterator for StoredChunks {
 
     fn next(&mut self) -> Option<Result<Vec<u8>>> {
         loop {
-            let next = self.paths.next();
+            let next = self.paths.next()?;
+            let name = match next {
+                Ok(name) => name,
+                Err(e) => return Some(Err(e)),
+            };
 
-            if let Some(next) = next {
-                let name = match next {
-                    Ok(name) => name,
-                    Err(e) => return Some(Err(e)),
-                };
-
-                let name = name
-                    .file_name()
-                    .expect("Path terminated with ..?")
-                    .to_string_lossy();
-                let bytes = name.to_string().into_bytes();
-                match Vec::from_hex(bytes) {
-                    Ok(digest) => {
-                        if digest.len() == self.digest_size {
-                            return Some(Ok(digest));
-                        }
-                        trace!(self.log, "skipping"; "path" => %name);
-                        // Maybe we should remove this file? It is not a valid
-                        // chunk
-                        // file.
+            let name = name
+                .file_name()
+                .expect("Path terminated with ..?")
+                .to_string_lossy();
+            let bytes = name.to_string().into_bytes();
+            match Vec::from_hex(bytes) {
+                Ok(digest) => {
+                    if digest.len() == self.digest_size {
+                        return Some(Ok(digest));
                     }
-                    Err(e) => trace!(
-                        self.log,
-                        "skipping";
-                        "path" => %name,
-                        "error" => %e
-                    ),
+                    trace!(self.log, "skipping"; "path" => %name);
+                    // Maybe we should remove this file? It is not a valid
+                    // chunk file.
                 }
-            } else {
-                return None;
+                Err(e) => trace!(
+                    self.log,
+                    "skipping";
+                    "path" => %name,
+                    "error" => %e
+                ),
             }
         }
     }

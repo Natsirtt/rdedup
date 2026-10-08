@@ -70,7 +70,7 @@ where
         })
         .and_then(|ref bytes| {
             T::try_from(bytes).map_err(|err| {
-                Error::custom(format!("{}", &err as &dyn (::std::error::Error)))
+                Error::custom(format!("{}", &err as &dyn std::error::Error))
             })
         })
 }
@@ -96,7 +96,7 @@ where
         })
         .and_then(|bytes: Vec<u8>| {
             T::try_from(&bytes).map_err(|err| {
-                Error::custom(format!("{}", &err as &dyn (::std::error::Error)))
+                Error::custom(format!("{}", &err as &dyn std::error::Error))
             })
         })
 }

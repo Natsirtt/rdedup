@@ -26,12 +26,9 @@ pub fn parse_size(input: &str) -> Option<u64> {
     };
 
     if let Some(unit) = unit {
-        if let Some(idx) = units.iter().position(|&u| u == unit) {
-            let modifier: u64 = 1024u64.pow(idx as u32 + 1);
-            size *= modifier;
-        } else {
-            return None;
-        }
+        let idx = units.iter().position(|&u| u == unit)?;
+        let modifier: u64 = 1024u64.pow(idx as u32 + 1);
+        size *= modifier;
     }
     Some(size)
 }

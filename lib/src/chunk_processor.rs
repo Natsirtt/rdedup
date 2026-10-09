@@ -1,9 +1,9 @@
+//! Chunk storage jobs acknowledge only complete, reusable chunks.
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc;
 
 use sgdata::SGData;
-use slog::{trace, Level, Logger};
-use slog_perf::TimeReporter;
 
 use super::aio;
 use super::{DataType, Repo};
@@ -12,17 +12,76 @@ use crate::encryption::ArcEncrypter;
 use crate::hashing::ArcHasher;
 use crate::{Digest, Generation};
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    #[error("chunk metadata failed at {path}")]
+    Metadata {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("chunk promotion failed at {path}")]
+    Promotion {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("chunk compression failed")]
+    Compression(#[source] io::Error),
+    #[error("chunk encryption failed")]
+    Encryption(#[source] io::Error),
+    #[error("chunk upload failed at {path}")]
+    Upload {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl From<Error> for io::Error {
+    fn from(error: Error) -> Self {
+        let kind = match &error {
+            Error::Metadata { source, .. }
+            | Error::Promotion { source, .. }
+            | Error::Upload { source, .. }
+            | Error::Compression(source)
+            | Error::Encryption(source) => source.kind(),
+        };
+        io::Error::new(kind, error)
+    }
+}
+
+/// Position within one ordered stream of data or index chunks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ChunkSequence(u64);
+
+impl ChunkSequence {
+    pub(crate) fn new(index: u64) -> Self {
+        Self(index)
+    }
+    pub(crate) fn as_index(self) -> u64 {
+        self.0
+    }
+}
+
+/// One storage job, with ownership of its contents and completion destination.
 pub(crate) struct Message {
-    pub data: (u64, SGData),
+    pub sequence: ChunkSequence,
+    pub contents: SGData,
     pub data_type: DataType,
-    pub response_tx: mpsc::Sender<(u64, Digest)>,
+    pub response: mpsc::Sender<Completion>,
+}
+
+/// Completion reports storage failure instead of acknowledging a missing chunk.
+pub(crate) struct Completion {
+    pub sequence: ChunkSequence,
+    pub result: Result<Digest, Error>,
 }
 
 pub(crate) struct ChunkProcessor {
     repo: Repo,
-    rx: crossbeam_channel::Receiver<Message>,
+    receiver: crossbeam_channel::Receiver<Message>,
     aio: aio::AsyncIO,
-    log: Logger,
     encrypter: ArcEncrypter,
     compressor: ArcCompression,
     hasher: ArcHasher,
@@ -32,7 +91,7 @@ pub(crate) struct ChunkProcessor {
 impl ChunkProcessor {
     pub fn new(
         repo: Repo,
-        rx: crossbeam_channel::Receiver<Message>,
+        receiver: crossbeam_channel::Receiver<Message>,
         aio: aio::AsyncIO,
         encrypter: ArcEncrypter,
         compressor: ArcCompression,
@@ -40,10 +99,9 @@ impl ChunkProcessor {
         generations: Vec<Generation>,
     ) -> Self {
         assert!(!generations.is_empty());
-        ChunkProcessor {
-            log: repo.log.clone(),
+        Self {
             repo,
-            rx,
+            receiver,
             aio,
             encrypter,
             compressor,
@@ -53,133 +111,100 @@ impl ChunkProcessor {
     }
 
     pub fn run(&self) {
-        let mut timer = TimeReporter::new_with_level(
-            "chunk-processing",
-            self.log.clone(),
-            Level::Debug,
-        );
-
-        let gen_strings: Vec<_> =
-            self.generations.iter().map(|gen| gen.to_string()).collect();
-
-        let last_gen_str = gen_strings.last().unwrap().to_owned();
-        loop {
-            timer.start("rx");
-
-            if let Ok(input) = self.rx.recv() {
-                timer.start("processing");
-
-                let Message {
-                    data,
-                    response_tx,
-                    data_type,
-                } = input;
-                let (sg_id, sg) = data;
-
-                let digest = Digest(self.hasher.calculate_digest(&sg));
-
-                let mut found = false;
-                // lookup all generations in order, starting from current one
-                // and at the end try the current gen. again, in case some other
-                // thread/ instance just moved it from older generation to the
-                // current one
-                for gen_str in gen_strings
-                    .iter()
-                    .rev()
-                    .chain([&last_gen_str].iter().cloned())
-                {
-                    let chunk_path = self.repo.chunk_rel_path_by_digest(
-                        digest.as_digest_ref(),
-                        gen_str,
-                    );
-                    match self.aio.read_metadata(chunk_path.clone()).wait() {
-                        Ok(_metadata) => {
-                            found = true;
-                            if gen_str == &last_gen_str {
-                                trace!(self.log, "already exists"; "path" => %chunk_path.display());
-                            } else {
-                                trace!(
-                                    self.log,
-                                    "already exists in previous generation";
-                                    "path" => %chunk_path.display()
-                                );
-                                let dst_path =
-                                    self.repo.chunk_rel_path_by_digest(
-                                        digest.as_digest_ref(),
-                                        gen_strings.last().unwrap(),
-                                    );
-                                self.aio
-                                    .promote_chunk(crate::backends::ChunkPromotion::new(
-                                        chunk_path.clone(),
-                                        dst_path.clone(),
-                                    ).expect("paths identify the same digest in strictly ordered generations"))
-                                    .wait()
-                                    .unwrap_or_else(|_e| {
-                                        // chunk might have been upated
-                                        // concurrently; check
-                                        // if it's already in the destination
-                                        if self
-                                            .aio
-                                            .read_metadata(dst_path.clone())
-                                            .wait()
-                                            .is_err()
-                                        {
-                                            panic!(
-                                                "rename failed {} -> {}",
-                                                chunk_path.display(),
-                                                dst_path.display()
-                                            )
-                                        }
-                                    });
-                            }
-                            break;
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => panic!(
-                            "read_metadata failed for {}, err: {}",
-                            chunk_path.display(),
-                            e
-                        ),
-                    }
-                }
-
-                if !found {
-                    let chunk_path = self.repo.chunk_rel_path_by_digest(
-                        digest.as_digest_ref(),
-                        gen_strings.last().unwrap(),
-                    );
-                    let sg = if data_type.should_compress() {
-                        trace!(self.log, "compress"; "path" => %chunk_path.display());
-                        timer.start("compress");
-                        self.compressor.compress(sg).unwrap()
-                    } else {
-                        sg
-                    };
-
-                    let sg = if data_type.should_encrypt() {
-                        trace!(self.log, "encrypt"; "path" => %chunk_path.display());
-                        timer.start("encrypt");
-                        self.encrypter.encrypt(sg, &digest.0).unwrap()
-                    } else {
-                        sg
-                    };
-
-                    timer.start("tx-writer");
-                    self.aio.write_checked_idempotent(
-                        self.repo.chunk_rel_path_by_digest(
-                            digest.as_digest_ref(),
-                            &last_gen_str,
-                        ),
-                        sg,
-                    );
-                }
-                timer.start("tx-digest");
-                response_tx
-                    .send((sg_id, digest))
-                    .expect("chunk_processor: digests_tx.send")
-            } else {
+        while let Ok(message) = self.receiver.recv() {
+            let result = self.store(message.contents, message.data_type);
+            if message
+                .response
+                .send(Completion {
+                    sequence: message.sequence,
+                    result,
+                })
+                .is_err()
+            {
+                // The index consumer has stopped; closing this worker's input
+                // lets the bounded producer unwind without a separate flag.
                 return;
             }
         }
+    }
+
+    fn store(
+        &self,
+        contents: SGData,
+        data_type: DataType,
+    ) -> Result<Digest, Error> {
+        let digest = Digest(self.hasher.calculate_digest(&contents));
+        // Construction requires at least one generation.
+        let current = self
+            .generations
+            .last()
+            .expect("a chunk processor requires a generation")
+            .to_string();
+        let destination = self
+            .repo
+            .chunk_rel_path_by_digest(digest.as_digest_ref(), &current);
+        for generation in self.generations.iter().rev() {
+            let path = self.repo.chunk_rel_path_by_digest(
+                digest.as_digest_ref(),
+                &generation.to_string(),
+            );
+            match self.aio.read_metadata(path.clone()).wait() {
+                Ok(metadata) => {
+                    if !metadata.is_file {
+                        return Err(Error::Metadata {
+                            path,
+                            source: io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "chunk is not a file",
+                            ),
+                        });
+                    }
+                    if path != destination {
+                        let promotion = crate::backends::ChunkPromotion::new(
+                            path,
+                            destination.clone(),
+                        )
+                        .map_err(|error| Error::Promotion {
+                            path: destination.clone(),
+                            source: io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                error,
+                            ),
+                        })?;
+                        self.aio.promote_chunk(promotion).wait().map_err(
+                            |source| Error::Promotion {
+                                path: destination.clone(),
+                                source,
+                            },
+                        )?;
+                    }
+                    return Ok(digest);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => return Err(Error::Metadata { path, source }),
+            }
+        }
+        let contents = if data_type.should_compress() {
+            self.compressor
+                .compress(contents)
+                .map_err(Error::Compression)?
+        } else {
+            contents
+        };
+        let contents = if data_type.should_encrypt() {
+            self.encrypter
+                .encrypt(contents, &digest.0)
+                .map_err(Error::Encryption)?
+        } else {
+            contents
+        };
+        self.aio
+            .write_idempotent(destination.clone(), contents)
+            .wait()
+            .map_err(|source| Error::Upload {
+                path: destination,
+                source,
+            })?;
+        Ok(digest)
     }
 }

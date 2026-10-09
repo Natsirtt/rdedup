@@ -676,3 +676,193 @@ fn reading_a_legacy_name_does_not_rewrite_it() {
     assert_eq!(fs::read_to_string(&path).unwrap(), legacy);
     wipe(&repository);
 }
+
+mod write_failures {
+    use super::*;
+    use crate::aio::local::Local;
+    use crate::backends::{
+        Backend, BackendOperation, BackendThread, BackendWorker,
+        ChunkPromotion, Exclusive, Metadata, OperationState, Shared,
+    };
+    use crate::SGData;
+
+    #[derive(Clone, Copy)]
+    enum Failure {
+        Upload,
+        Metadata,
+        Promotion,
+    }
+
+    struct FailingBackend {
+        path: PathBuf,
+        failure: Failure,
+    }
+    struct FailingOperation {
+        local: BackendOperation<Shared>,
+        failure: Failure,
+    }
+    struct FailingWorker {
+        local: BackendWorker<Shared>,
+        failure: Failure,
+    }
+
+    impl Backend for FailingBackend {
+        fn begin_shared(&self) -> io::Result<BackendOperation<Shared>> {
+            Ok(BackendOperation::new(FailingOperation {
+                local: Local::new(self.path.clone()).begin_shared()?,
+                failure: self.failure,
+            }))
+        }
+        fn begin_exclusive(&self) -> io::Result<BackendOperation<Exclusive>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "test uses shared operations",
+            ))
+        }
+    }
+    impl OperationState for FailingOperation {
+        fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
+            Ok(Box::new(FailingWorker {
+                local: self.local.new_thread()?,
+                failure: self.failure,
+            }))
+        }
+    }
+    fn injected() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected storage failure",
+        )
+    }
+    fn is_chunk(path: &std::path::Path) -> bool {
+        path.components()
+            .any(|component| component.as_os_str() == "chunk")
+    }
+    impl BackendThread for FailingWorker {
+        fn write(
+            &mut self,
+            path: PathBuf,
+            contents: SGData,
+            idempotent: bool,
+        ) -> io::Result<()> {
+            assert!(idempotent);
+            if matches!(self.failure, Failure::Upload) && is_chunk(&path) {
+                return Err(injected());
+            }
+            self.local.create(path, contents)
+        }
+        fn read(&mut self, path: PathBuf) -> io::Result<SGData> {
+            self.local.read(path)
+        }
+        fn read_metadata(&mut self, path: PathBuf) -> io::Result<Metadata> {
+            if matches!(self.failure, Failure::Metadata) && is_chunk(&path) {
+                return Err(injected());
+            }
+            self.local.read_metadata(path)
+        }
+        fn promote_chunk(
+            &mut self,
+            promotion: ChunkPromotion,
+        ) -> io::Result<()> {
+            if matches!(self.failure, Failure::Promotion) {
+                return Err(injected());
+            }
+            self.local.promote_chunk(promotion)
+        }
+        fn list(&mut self, path: PathBuf) -> io::Result<Vec<PathBuf>> {
+            self.local.list(path)
+        }
+        fn list_recursively(
+            &mut self,
+            path: PathBuf,
+            sender: std::sync::mpsc::Sender<io::Result<Vec<PathBuf>>>,
+        ) {
+            self.local.list_recursively(path, sender);
+        }
+        fn remove(&mut self, _: PathBuf) -> io::Result<()> {
+            panic!("shared worker must not remove")
+        }
+        fn remove_dir_all(&mut self, _: PathBuf) -> io::Result<()> {
+            panic!("shared worker must not remove directories")
+        }
+        fn rename(&mut self, _: PathBuf, _: PathBuf) -> io::Result<()> {
+            panic!("shared worker must not rename")
+        }
+    }
+    fn inject(repository: &mut lib::Repo, path: PathBuf, failure: Failure) {
+        repository.backend_select = Arc::new(move || {
+            Ok(Box::new(FailingBackend {
+                path: path.clone(),
+                failure,
+            }))
+        });
+    }
+
+    #[test]
+    fn chunk_upload_and_lookup_errors_reach_the_caller_without_publication() {
+        for failure in [Failure::Upload, Failure::Metadata] {
+            let (mut repository, directory) = test_repo_dir(PASS);
+            let encryption =
+                repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+            inject(&mut repository, directory.clone(), failure);
+            let error = repository
+                .write(
+                    "failed",
+                    io::Cursor::new(vec![7; 2 * 1024 * 1024]),
+                    &encryption,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(repository.list_names().unwrap().is_empty());
+            drop(repository);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn promotion_failure_prevents_publication() {
+        let (mut repository, directory) = test_repo_dir(PASS);
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+        repository
+            .write("original", io::Cursor::new(b"archive bytes"), &encryption)
+            .unwrap();
+        let operation = (repository.backend_select)()
+            .unwrap()
+            .begin_shared()
+            .unwrap();
+        let aio = crate::aio::AsyncIO::new(operation, repository.log.clone())
+            .unwrap();
+        let generations = repository.read_generations(&aio).unwrap();
+        generations.last().unwrap().gen_next().write(&aio).unwrap();
+        drop(aio);
+        inject(&mut repository, directory.clone(), Failure::Promotion);
+        let error = repository
+            .write("failed", io::Cursor::new(b"archive bytes"), &encryption)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(repository.list_names().unwrap(), ["original"]);
+        drop(repository);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    struct FailingReader;
+    impl io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(injected())
+        }
+    }
+    #[test]
+    fn input_failure_returns_without_publishing_a_partial_archive() {
+        use io::Read;
+        let repository = test_repo(PASS);
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+        let input =
+            io::Cursor::new(vec![5; 2 * 1024 * 1024]).chain(FailingReader);
+        let error = repository.write("failed", input, &encryption).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(repository.list_names().unwrap().is_empty());
+        wipe(&repository);
+    }
+}

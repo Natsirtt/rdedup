@@ -39,7 +39,7 @@ struct WriteArgs {
     path: PathBuf,
     data: SGData,
     idempotent: bool,
-    complete_tx: Option<mpsc::Sender<io::Result<()>>>,
+    complete_tx: mpsc::Sender<io::Result<()>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -211,21 +211,10 @@ impl AsyncIO {
                 path,
                 data: sg,
                 idempotent: true,
-                complete_tx: Some(tx),
+                complete_tx: tx,
             }))
             .expect("aio tx closed: write_idempotent");
         AsyncIOResult { rx }
-    }
-
-    pub fn write_checked_idempotent(&self, path: PathBuf, sg: SGData) {
-        self.tx
-            .send(Message::Write(WriteArgs {
-                path,
-                data: sg,
-                idempotent: true,
-                complete_tx: None,
-            }))
-            .expect("aio tx closed: write_checked_idempotent");
     }
 
     pub fn read(&self, path: PathBuf) -> AsyncIOResult<SGData> {
@@ -275,7 +264,7 @@ impl ExclusiveAsyncIO {
                 path,
                 data: sg,
                 idempotent: false,
-                complete_tx: Some(tx),
+                complete_tx: tx,
             }))
             .expect("aio tx closed: write");
         AsyncIOResult { rx }
@@ -506,19 +495,15 @@ impl AsyncIOThread {
         path: PathBuf,
         sg: SGData,
         idempotent: bool,
-        tx: Option<mpsc::Sender<io::Result<()>>>,
+        tx: mpsc::Sender<io::Result<()>>,
     ) {
         trace!(self.log, "write"; "path" => %path.display());
 
         self.time_reporter.start("read");
         let res = self.write_inner(path, sg, idempotent);
 
-        if let Some(tx) = tx {
-            self.time_reporter.start("write send response");
-            tx.send(res).expect("send failed")
-        } else {
-            res.unwrap();
-        }
+        // A cancelled consumer can drop its receipt while storage finishes.
+        let _ = tx.send(res);
     }
 
     fn pending_wait_and_insert<'a, 'path>(
@@ -550,7 +535,7 @@ impl AsyncIOThread {
             self.backend.borrow_mut().thread.read(path.clone())
         };
         self.time_reporter.start("read send response");
-        tx.send(res).expect("send failed")
+        let _ = tx.send(res);
     }
 
     fn read_metadata(
@@ -567,7 +552,7 @@ impl AsyncIOThread {
         };
 
         self.time_reporter.start("read send response");
-        tx.send(res).expect("send failed")
+        let _ = tx.send(res);
     }
 
     fn list(
@@ -580,7 +565,7 @@ impl AsyncIOThread {
         self.time_reporter.start("list");
         let res = self.backend.borrow_mut().thread.list(path);
         self.time_reporter.start("list send response");
-        tx.send(res).expect("send failed")
+        let _ = tx.send(res);
     }
 
     fn list_recursively(
@@ -603,7 +588,7 @@ impl AsyncIOThread {
             self.backend.borrow_mut().thread.remove(path.clone())
         };
         self.time_reporter.start("remove send response");
-        tx.send(res).expect("send failed")
+        let _ = tx.send(res);
     }
 
     fn remove_dir_all(
@@ -617,7 +602,7 @@ impl AsyncIOThread {
         let res = self.backend.borrow_mut().thread.remove_dir_all(path);
 
         self.time_reporter.start("remove send response");
-        tx.send(res).expect("send failed")
+        let _ = tx.send(res);
     }
 
     fn rename(
@@ -643,7 +628,7 @@ impl AsyncIOThread {
                 .rename(src_path.clone(), dst_path.clone())
         };
         self.time_reporter.start("remove send response");
-        tx.send(res).expect("send failed")
+        let _ = tx.send(res);
     }
 }
 // }}}

@@ -1,0 +1,15 @@
+[package]
+name = "rdedup-protocol"
+version = "3.2.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Shared wire contract for rdedup HTTP repositories"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+http = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

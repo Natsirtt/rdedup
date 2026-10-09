@@ -1,11 +1,10 @@
 // {{{ use and mod
 use std::io::{Read, Write};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::{fs, io, mem};
 
-use rand::distr::Alphanumeric;
-use rand::Rng;
 use sgdata::SGData;
 use walkdir::WalkDir;
 
@@ -26,51 +25,139 @@ pub struct Local {
     path: PathBuf,
 }
 
+mod stream;
+pub use stream::{
+    Error as StreamError, PendingObject, Publication, StoredObject,
+};
+
 #[derive(Debug)]
 pub struct LocalThread {
-    path: PathBuf,
-    rand_ext: String,
+    protection: Arc<LocalProtection>,
 }
 
-struct LocalOperation {
+#[derive(Debug)]
+struct LocalProtection {
     path: PathBuf,
     _lock: fs::File,
 }
 
+/// Local storage protection shared by workers and streamed objects.
+///
+/// A stream keeps this exact protection alive until its file is closed.
+pub struct LocalOperation<Access> {
+    protection: Arc<LocalProtection>,
+    access: PhantomData<Access>,
+}
+
 impl Backend for Local {
     fn begin_exclusive(&self) -> io::Result<BackendOperation<Exclusive>> {
-        let file = self.open_lock_file()?;
-        fs2::FileExt::lock_exclusive(&file)?;
-        Ok(BackendOperation::new(LocalOperation {
-            path: self.path.clone(),
-            _lock: file,
-        }))
+        Ok(self.exclusive_operation()?.workers())
     }
-
     fn begin_shared(&self) -> io::Result<BackendOperation<Shared>> {
-        let file = self.open_lock_file()?;
-        fs2::FileExt::lock_shared(&file)?;
-        Ok(BackendOperation::new(LocalOperation {
-            path: self.path.clone(),
-            _lock: file,
+        Ok(self.shared_operation()?.workers())
+    }
+}
+
+struct LocalWorkerFactory {
+    protection: Arc<LocalProtection>,
+}
+
+impl OperationState for LocalWorkerFactory {
+    fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
+        Ok(Box::new(LocalThread {
+            protection: Arc::clone(&self.protection),
         }))
     }
 }
 
-impl OperationState for LocalOperation {
-    fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
-        Ok(Box::new(LocalThread {
-            path: self.path.clone(),
-            rand_ext: rand::rng()
-                .sample_iter(&Alphanumeric)
-                .take(20)
-                .map(char::from)
-                .collect(),
-        }))
+impl<Access> LocalOperation<Access> {
+    /// Share this operation's protection with capability-restricted workers.
+    pub fn workers(&self) -> BackendOperation<Access> {
+        BackendOperation::new(LocalWorkerFactory {
+            protection: Arc::clone(&self.protection),
+        })
+    }
+
+    /// Open an object whose file lifetime retains repository protection.
+    ///
+    /// # Errors
+    /// Returns an error if the object cannot be opened.
+    pub fn read_object(
+        &self,
+        path: &Path,
+    ) -> Result<StoredObject, StreamError> {
+        StoredObject::open(Arc::clone(&self.protection), path)
+    }
+
+    /// Stage an object for atomic publication without replacing a destination.
+    ///
+    /// The destination is invisible until commit. Dropping the staged object
+    /// closes its file and removes its temporary entry.
+    ///
+    /// # Errors
+    /// Returns an error if temporary storage cannot be prepared.
+    pub fn create_object(
+        &self,
+        path: &Path,
+    ) -> Result<PendingObject, StreamError> {
+        PendingObject::new(
+            Arc::clone(&self.protection),
+            path,
+            stream::PublicationMode::Create,
+        )
+    }
+}
+
+impl LocalOperation<Exclusive> {
+    /// Stage a replacement while retaining exclusive repository protection.
+    ///
+    /// # Errors
+    /// Returns an error if temporary storage cannot be prepared.
+    pub fn replace_object(
+        &self,
+        path: &Path,
+    ) -> Result<PendingObject, StreamError> {
+        PendingObject::new(
+            Arc::clone(&self.protection),
+            path,
+            stream::PublicationMode::Replace,
+        )
     }
 }
 
 impl Local {
+    /// Acquire shared protection for streamed reads and additive writes.
+    ///
+    /// # Errors
+    /// Returns a filesystem or lock acquisition failure.
+    pub fn shared_operation(&self) -> io::Result<LocalOperation<Shared>> {
+        let file = self.open_lock_file()?;
+        fs2::FileExt::lock_shared(&file)?;
+        Ok(LocalOperation {
+            protection: Arc::new(LocalProtection {
+                path: self.path.clone(),
+                _lock: file,
+            }),
+            access: PhantomData,
+        })
+    }
+
+    /// Acquire exclusive protection for streamed replacements.
+    ///
+    /// # Errors
+    /// Returns a filesystem or lock acquisition failure.
+    pub fn exclusive_operation(&self) -> io::Result<LocalOperation<Exclusive>> {
+        let file = self.open_lock_file()?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(LocalOperation {
+            protection: Arc::new(LocalProtection {
+                path: self.path.clone(),
+                _lock: file,
+            }),
+            access: PhantomData,
+        })
+    }
+
     fn open_lock_file(&self) -> io::Result<fs::File> {
         fs::create_dir_all(&self.path)?;
         fs::OpenOptions::new()
@@ -91,8 +178,9 @@ impl BackendThread for LocalThread {
         &mut self,
         promotion: super::promotion::ChunkPromotion,
     ) -> io::Result<()> {
-        let source = self.path.join(promotion.source_path());
-        let destination = self.path.join(promotion.destination_path());
+        let source = self.protection.path.join(promotion.source_path());
+        let destination =
+            self.protection.path.join(promotion.destination_path());
         // Validated chunk paths have a generation and chunk directory, so the
         // destination has a parent regardless of repository nesting depth.
         let parent = destination.parent().ok_or_else(|| {
@@ -119,7 +207,7 @@ impl BackendThread for LocalThread {
     }
 
     fn remove_dir_all(&mut self, path: PathBuf) -> io::Result<()> {
-        let path = self.path.join(path);
+        let path = self.protection.path.join(path);
         fs::remove_dir_all(&path)
     }
 
@@ -128,8 +216,8 @@ impl BackendThread for LocalThread {
         src_path: PathBuf,
         dst_path: PathBuf,
     ) -> io::Result<()> {
-        let src_path = self.path.join(src_path);
-        let dst_path = self.path.join(dst_path);
+        let src_path = self.protection.path.join(src_path);
+        let dst_path = self.protection.path.join(dst_path);
 
         match fs::rename(&src_path, &dst_path) {
             Ok(_) => Ok(()),
@@ -146,51 +234,23 @@ impl BackendThread for LocalThread {
         sg: SGData,
         idempotent: bool,
     ) -> io::Result<()> {
-        let path = self.path.join(path);
-        // check if exists on disk
-        // remove from `in_progress` if it does
-        if idempotent && path.exists() {
-            return Ok(());
-        }
-
-        let tmp_path = path.with_extension(format!("{}.tmp", self.rand_ext));
-        let mut chunk_file = match fs::File::create(&tmp_path) {
-            Ok(file) => Ok(file),
-            Err(_) => {
-                fs::create_dir_all(path.parent().unwrap())?;
-                fs::File::create(&tmp_path)
-            }
-        }?;
-
-        for data_part in sg.as_parts() {
-            chunk_file.write_all(data_part)?;
-        }
-
-        chunk_file.sync_data()?;
-        drop(chunk_file);
-
-        if idempotent {
-            match fs::hard_link(&tmp_path, &path) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&tmp_path);
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let _ = fs::remove_file(&tmp_path);
-                }
-                Err(error) => {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(error);
-                }
-            }
+        let mode = if idempotent {
+            stream::PublicationMode::Create
         } else {
-            fs::rename(&tmp_path, &path)?;
+            stream::PublicationMode::Replace
+        };
+        let mut pending =
+            PendingObject::new(Arc::clone(&self.protection), &path, mode)
+                .map_err(io::Error::from)?;
+        for part in sg.as_parts() {
+            pending.write_all(part)?;
         }
-
+        pending.commit().map_err(io::Error::from)?;
         Ok(())
     }
 
     fn read(&mut self, path: PathBuf) -> io::Result<SGData> {
-        let path = self.path.join(path);
+        let path = self.protection.path.join(path);
 
         let mut file = fs::File::open(&path)?;
 
@@ -208,12 +268,12 @@ impl BackendThread for LocalThread {
     }
 
     fn remove(&mut self, path: PathBuf) -> io::Result<()> {
-        let path = self.path.join(path);
+        let path = self.protection.path.join(path);
         fs::remove_file(&path)
     }
 
     fn read_metadata(&mut self, path: PathBuf) -> io::Result<Metadata> {
-        let path = self.path.join(path);
+        let path = self.protection.path.join(path);
         let md = fs::metadata(&path)?;
         let created = if let Ok(created) = md.created().map(Into::into) {
             created
@@ -233,7 +293,7 @@ impl BackendThread for LocalThread {
     }
 
     fn list(&mut self, path: PathBuf) -> io::Result<Vec<PathBuf>> {
-        let path = self.path.join(path);
+        let path = self.protection.path.join(path);
         let mut v = Vec::with_capacity(128);
 
         let dir = fs::read_dir(path);
@@ -256,7 +316,7 @@ impl BackendThread for LocalThread {
         path: PathBuf,
         tx: mpsc::Sender<io::Result<Vec<PathBuf>>>,
     ) {
-        let path = self.path.join(path);
+        let path = self.protection.path.join(path);
 
         if !path.exists() {
             return;
@@ -323,6 +383,94 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    fn assert_no_temporary_files(directory: &RepositoryDirectory) {
+        for entry in walkdir::WalkDir::new(&directory.0) {
+            let entry = entry.unwrap();
+            assert!(!entry.file_name().to_string_lossy().ends_with(".tmp"));
+        }
+    }
+
+    #[test]
+    fn cancelled_stream_keeps_protection_until_its_file_is_removed() {
+        use std::io::Write;
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let operation = backend.shared_operation().unwrap();
+        let mut pending = operation
+            .create_object(std::path::Path::new("object"))
+            .unwrap();
+        pending.write_all(b"incomplete").unwrap();
+        let observer = directory.observer();
+        drop(operation);
+        assert!(observer.try_lock_exclusive().is_err());
+        assert!(!directory.0.join("object").exists());
+        drop(pending);
+        assert_no_temporary_files(&directory);
+        observer.try_lock_exclusive().unwrap();
+    }
+
+    #[test]
+    fn streamed_reader_retains_its_operation_until_closed() {
+        use std::io::{Read, Write};
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let operation = backend.shared_operation().unwrap();
+        let mut pending = operation
+            .create_object(std::path::Path::new("object"))
+            .unwrap();
+        std::io::copy(&mut std::io::repeat(42).take(1024 * 1024), &mut pending)
+            .unwrap();
+        pending.flush().unwrap();
+        assert_eq!(pending.commit().unwrap(), super::Publication::Published);
+        let mut reader = operation
+            .read_object(std::path::Path::new("object"))
+            .unwrap();
+        let observer = directory.observer();
+        drop(operation);
+        assert!(observer.try_lock_exclusive().is_err());
+        let mut contents = Vec::new();
+        reader.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, vec![42; 1024 * 1024]);
+        drop(reader);
+        observer.try_lock_exclusive().unwrap();
+    }
+
+    #[test]
+    fn competing_staged_creates_preserve_the_first_complete_object() {
+        use std::io::Write;
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let operation = backend.shared_operation().unwrap();
+        let mut first = operation
+            .create_object(std::path::Path::new("object"))
+            .unwrap();
+        let mut second = operation
+            .create_object(std::path::Path::new("object"))
+            .unwrap();
+        first.write_all(b"first").unwrap();
+        second.write_all(b"second").unwrap();
+        assert_eq!(first.commit().unwrap(), super::Publication::Published);
+        assert_eq!(second.commit().unwrap(), super::Publication::AlreadyExists);
+        assert_eq!(fs::read(directory.0.join("object")).unwrap(), b"first");
+        assert_no_temporary_files(&directory);
+    }
+
+    #[test]
+    fn failed_publication_removes_its_staged_file() {
+        use std::io::Write;
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let operation = backend.shared_operation().unwrap();
+        let mut pending = operation
+            .create_object(std::path::Path::new("object"))
+            .unwrap();
+        pending.write_all(b"contents").unwrap();
+        fs::create_dir(directory.0.join("object")).unwrap();
+        assert!(pending.commit().is_err());
+        assert!(directory.0.join("object").is_dir());
+        assert_no_temporary_files(&directory);
     }
 
     #[test]

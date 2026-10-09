@@ -27,6 +27,7 @@ backend-b2 = ["backblaze-b2", "hyper", "hyper-native-tls"]
 backend-http = ["reqwest"]
 
 [dependencies]
+thiserror = { workspace = true }
 rdedup-cdc = "0.1.0"
 sodiumoxide = { version = "0.2", features = ["serde"] }
 fs2 = "0.4"

@@ -128,7 +128,7 @@ impl Generation {
         let config_str =
             serde_yaml::to_string(&config).expect("yaml serialization failed");
 
-        aio.write(
+        aio.write_idempotent(
             self.config_path(),
             SGData::from_single(config_str.into_bytes()),
         )

@@ -59,7 +59,11 @@ use self::misc::*;
 // Fancy reexport of backends API and particular backends structs
 pub mod backends {
     use crate::aio;
-    pub use crate::aio::backend::{Backend, BackendThread, Lock};
+    pub use crate::aio::backend::{
+        Backend, BackendOperation, BackendThread, BackendWorker, Exclusive,
+        OperationState, Shared,
+    };
+    pub use crate::aio::promotion::{ChunkPromotion, Error as PromotionError};
     pub use crate::aio::Metadata;
     use std::io;
     use url::Url;
@@ -83,7 +87,7 @@ pub mod backends {
 
     #[cfg(feature = "backend-b2")]
     pub mod b2 {
-        pub use crate::aio::b2::{Auth, B2Thread, Lock, B2};
+        pub use crate::aio::b2::{Auth, B2Thread, B2};
     }
 }
 
@@ -154,8 +158,6 @@ pub struct Repo {
 
     /// Logger
     log: slog::Logger,
-
-    aio: aio::AsyncIO,
 }
 
 impl Repo {
@@ -186,9 +188,11 @@ impl Repo {
     }
 
     fn ensure_repo_empty_or_new(aio: &AsyncIO) -> Result<()> {
-        let list = aio.list(PathBuf::from(".")).wait();
-
-        if list.is_ok() && !list.unwrap().is_empty() {
+        let entries = aio.list(PathBuf::from(".")).wait()?;
+        if entries.iter().any(|path| {
+            path.file_name()
+                .is_none_or(|name| name != config::LOCK_FILE)
+        }) {
             return Err(Error::new(
                 io::ErrorKind::AlreadyExists,
                 "repo dir must not exist or be empty to be used",
@@ -238,9 +242,10 @@ impl Repo {
             .unwrap_or_else(|| Logger::root(slog::Discard, o!()));
 
         let backend = backend_select()?;
-        let aio = aio::AsyncIO::new(backend, log.clone())?;
+        let operation = backend.begin_exclusive()?;
+        let aio = aio::ExclusiveAsyncIO::new(operation, log.clone())?;
 
-        Repo::ensure_repo_empty_or_new(&aio)?;
+        Repo::ensure_repo_empty_or_new(aio.shared())?;
         let config = config::Repo::new_from_settings(passphrase, settings)?;
         config.write(&aio)?;
 
@@ -253,7 +258,6 @@ impl Repo {
             compression,
             hasher,
             log,
-            aio,
         })
     }
 
@@ -267,7 +271,8 @@ impl Repo {
             .unwrap_or_else(|| Logger::root(slog::Discard, o!()));
 
         let backend = backend_select()?;
-        let aio = aio::AsyncIO::new(backend, log.clone())?;
+        let operation = backend.begin_shared()?;
+        let aio = aio::AsyncIO::new(operation, log.clone())?;
 
         let config = config::Repo::read(&aio)?;
 
@@ -279,7 +284,6 @@ impl Repo {
             compression,
             hasher,
             log,
-            aio,
         })
     }
 
@@ -289,7 +293,8 @@ impl Repo {
         old_p: PassphraseFn<'_>,
         new_p: PassphraseFn<'_>,
     ) -> Result<()> {
-        let _lock = self.aio.lock_exclusive()?;
+        let operation = (self.backend_select)()?.begin_exclusive()?;
+        let aio = aio::ExclusiveAsyncIO::new(operation, self.log.clone())?;
 
         if self.config.version == 0 {
             Err(Error::new(
@@ -302,7 +307,7 @@ impl Repo {
                 new_p,
                 &self.config.pwhash,
             )?;
-            self.config.write(&self.aio)?;
+            self.config.write(&aio)?;
             Ok(())
         }
     }
@@ -435,17 +440,25 @@ impl Repo {
         }
     }
 
-    fn get_chunk_accessor(
-        &self,
+    fn get_chunk_accessor<'a>(
+        &'a self,
+        aio: &'a AsyncIO,
         decrypter: Option<ArcDecrypter>,
         compression: ArcCompression,
         generations: Vec<Generation>,
-    ) -> DefaultChunkAccessor<'_> {
-        DefaultChunkAccessor::new(self, decrypter, compression, generations)
+    ) -> DefaultChunkAccessor<'a> {
+        DefaultChunkAccessor::new(
+            self,
+            aio,
+            decrypter,
+            compression,
+            generations,
+        )
     }
 
     fn get_recording_chunk_accessor<'a>(
         &'a self,
+        aio: &'a AsyncIO,
         accessed: &'a mut HashSet<Vec<u8>>,
         decrypter: Option<ArcDecrypter>,
         compression: ArcCompression,
@@ -453,6 +466,7 @@ impl Repo {
     ) -> RecordingChunkAccessor<'a> {
         RecordingChunkAccessor::new(
             self,
+            aio,
             accessed,
             decrypter,
             compression,
@@ -462,10 +476,11 @@ impl Repo {
 
     fn wipe_generation_maybe(
         &self,
+        aio: &ExclusiveAsyncIO,
         gen: Generation,
         min_age_secs: u64,
     ) -> io::Result<()> {
-        let gen_config = match gen.load_config(&self.aio) {
+        let gen_config = match gen.load_config(aio.shared()) {
             Ok(c) => c,
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
                 info!(
@@ -501,32 +516,29 @@ impl Repo {
         // so that we don't leave garbage with no Generation
         // config file.
         substitute_err_not_found(
-            self.aio
-                .remove_dir_all(
-                    PathBuf::from(gen.to_string()).join(NAME_SUBDIR),
-                )
-                .wait(),
+            aio.remove_dir_all(
+                PathBuf::from(gen.to_string()).join(NAME_SUBDIR),
+            )
+            .wait(),
             || (),
         )?;
 
         substitute_err_not_found(
-            self.aio
-                .remove_dir_all(
-                    PathBuf::from(gen.to_string()).join(config::DATA_SUBDIR),
-                )
-                .wait(),
+            aio.remove_dir_all(
+                PathBuf::from(gen.to_string()).join(config::DATA_SUBDIR),
+            )
+            .wait(),
             || (),
         )?;
 
-        self.aio
-            .remove_dir_all(PathBuf::from(gen.to_string()))
-            .wait()?;
+        aio.remove_dir_all(PathBuf::from(gen.to_string())).wait()?;
 
         Ok(())
     }
 
     fn update_name_to(
         &self,
+        aio: &ExclusiveAsyncIO,
         name_str: &str,
         cur_gen: Generation,
         generations: &[Generation],
@@ -539,11 +551,12 @@ impl Repo {
             "name" => name_str,
             "gen" => FnValue(|_| cur_gen.to_string())
         );
-        let name = Name::load_from_any(name_str, generations, &self.aio)?;
+        let name = Name::load_from_any(name_str, generations, aio.shared())?;
         let data_address: DataAddress = name.into();
 
         let accessor = GenerationUpdateChunkAccessor::new(
             self,
+            aio.shared(),
             Arc::clone(&self.compression),
             generations.to_vec(),
         );
@@ -557,13 +570,14 @@ impl Repo {
             ))?;
         }
 
-        Name::update_generation_to(name_str, cur_gen, generations, &self.aio)?;
+        Name::update_generation_to(name_str, cur_gen, generations, aio)?;
 
         Ok(())
     }
 
     fn reachable_recursively_insert(
         &self,
+        aio: &AsyncIO,
         da: DataAddressRef<'_>,
         reachable_digests: &mut HashSet<Vec<u8>>,
         generations: Vec<Generation>,
@@ -571,6 +585,7 @@ impl Repo {
         reachable_digests.insert(da.digest.0.into());
 
         let accessor = self.get_recording_chunk_accessor(
+            aio,
             reachable_digests,
             None,
             Arc::clone(&self.compression),
@@ -588,15 +603,18 @@ impl Repo {
     /// Return all reachable chunks
     #[allow(dead_code)] // tests
     fn list_reachable_chunks(&self) -> Result<HashSet<Vec<u8>>> {
-        let generations = self.read_generations()?;
+        let operation = (self.backend_select)()?.begin_shared()?;
+        let aio = aio::AsyncIO::new(operation, self.log.clone())?;
+        let generations = self.read_generations(&aio)?;
         let mut reachable_digests = HashSet::new();
-        let all_names = Name::list_all(&generations, &self.aio)?;
+        let all_names = Name::list_all(&generations, &aio)?;
         for name_str in &all_names {
-            match Name::load_from_any(name_str, &generations, &self.aio) {
+            match Name::load_from_any(name_str, &generations, &aio) {
                 Ok(name) => {
                     let data_address: DataAddress = name.into();
                     info!(self.log, "processing"; "name" => name_str);
                     self.reachable_recursively_insert(
+                        &aio,
                         data_address.as_ref(),
                         &mut reachable_digests,
                         generations.clone(),
@@ -628,20 +646,23 @@ impl Repo {
     }
 
     pub fn list_names(&self) -> io::Result<Vec<String>> {
-        let _lock = self.aio.lock_shared()?;
-        Name::list_all(&self.read_generations()?, &self.aio)
+        let operation = (self.backend_select)()?.begin_shared()?;
+        let aio = aio::AsyncIO::new(operation, self.log.clone())?;
+        Name::list_all(&self.read_generations(&aio)?, &aio)
     }
 
     /// Remove a stored name from repo
     pub fn rm(&self, name: &str) -> Result<()> {
-        let _lock = self.aio.lock_exclusive()?;
-        Name::remove_any(name, &self.read_generations()?, &self.aio)
+        let operation = (self.backend_select)()?.begin_exclusive()?;
+        let aio = aio::ExclusiveAsyncIO::new(operation, self.log.clone())?;
+        Name::remove_any(name, &self.read_generations(aio.shared())?, &aio)
     }
 
     pub fn gc(&self, min_age_secs: u64) -> Result<()> {
-        let _lock = self.aio.lock_exclusive()?;
+        let operation = (self.backend_select)()?.begin_exclusive()?;
+        let aio = aio::ExclusiveAsyncIO::new(operation, self.log.clone())?;
 
-        let generations = self.read_generations()?;
+        let generations = self.read_generations(aio.shared())?;
 
         if generations.is_empty() {
             info!(self.log, "Nothing in the repository yet, nothing to gc");
@@ -651,7 +672,7 @@ impl Repo {
         if generations.len() == 1 {
             let new_gen = generations.last().unwrap().gen_next();
             info!(self.log, "Creating new generation"; "gen" => FnValue(|_| new_gen.to_string()));
-            new_gen.write(&self.aio)?;
+            new_gen.write(aio.shared())?;
         } else {
             info!(
                 self.log,
@@ -661,7 +682,7 @@ impl Repo {
         }
 
         loop {
-            let generations = self.read_generations()?;
+            let generations = self.read_generations(aio.shared())?;
             assert!(!generations.is_empty());
             if generations.len() == 1 {
                 info!(
@@ -674,7 +695,7 @@ impl Repo {
             let gen_oldest = generations[0];
             let gen_cur = generations.last().unwrap();
 
-            let names = Name::list(gen_oldest, &self.aio)?;
+            let names = Name::list(gen_oldest, aio.shared())?;
 
             info!(
                 self.log,
@@ -683,10 +704,10 @@ impl Repo {
                 "gen" => FnValue(|_| gen_oldest.to_string())
             );
             if names.is_empty() {
-                self.wipe_generation_maybe(gen_oldest, min_age_secs)?;
+                self.wipe_generation_maybe(&aio, gen_oldest, min_age_secs)?;
                 return Ok(());
             }
-            self.update_name_to(&names[0], *gen_cur, &generations)?;
+            self.update_name_to(&aio, &names[0], *gen_cur, &generations)?;
         }
     }
 
@@ -696,14 +717,16 @@ impl Repo {
         writer: &mut W,
         dec: &DecryptHandle,
     ) -> Result<()> {
-        let _lock = self.aio.lock_shared()?;
+        let operation = (self.backend_select)()?.begin_shared()?;
+        let aio = aio::AsyncIO::new(operation, self.log.clone())?;
 
-        let generations = self.read_generations()?;
+        let generations = self.read_generations(&aio)?;
 
-        let name = Name::load_from_any(name_str, &generations, &self.aio)?;
+        let name = Name::load_from_any(name_str, &generations, &aio)?;
         let data_address: DataAddress = name.into();
 
         let accessor = self.get_chunk_accessor(
+            &aio,
             Some(Arc::clone(&dec.decrypter)),
             Arc::clone(&self.compression),
             generations,
@@ -718,15 +741,17 @@ impl Repo {
     }
 
     pub fn du(&self, name_str: &str, dec: &DecryptHandle) -> Result<DuResults> {
-        let _lock = self.aio.lock_shared()?;
+        let operation = (self.backend_select)()?.begin_shared()?;
+        let aio = aio::AsyncIO::new(operation, self.log.clone())?;
 
-        let generations = self.read_generations()?;
-        let name = Name::load_from_any(name_str, &generations, &self.aio)?;
+        let generations = self.read_generations(&aio)?;
+        let name = Name::load_from_any(name_str, &generations, &aio)?;
         let data_address: DataAddress = name.into();
 
         let mut counter = CounterWriter::new();
         let accessor = VerifyingChunkAccessor::new(
             self,
+            &aio,
             Some(Arc::clone(&dec.decrypter)),
             Arc::clone(&self.compression),
             generations,
@@ -751,16 +776,18 @@ impl Repo {
         name_str: &str,
         dec: &DecryptHandle,
     ) -> Result<VerifyResults> {
-        let _lock = self.aio.lock_shared()?;
+        let operation = (self.backend_select)()?.begin_shared()?;
+        let aio = aio::AsyncIO::new(operation, self.log.clone())?;
 
-        let generations = self.read_generations()?;
+        let generations = self.read_generations(&aio)?;
 
-        let name = Name::load_from_any(name_str, &generations, &self.aio)?;
+        let name = Name::load_from_any(name_str, &generations, &aio)?;
         let data_address: DataAddress = name.into();
 
         let mut counter = CounterWriter::new();
         let accessor = VerifyingChunkAccessor::new(
             self,
+            &aio,
             Some(Arc::clone(&dec.decrypter)),
             Arc::clone(&self.compression),
             generations,
@@ -777,9 +804,8 @@ impl Repo {
         Ok(accessor.get_results())
     }
 
-    fn read_generations(&self) -> io::Result<Vec<Generation>> {
-        let mut list: Vec<_> = self
-            .aio
+    fn read_generations(&self, aio: &AsyncIO) -> io::Result<Vec<Generation>> {
+        let mut list: Vec<_> = aio
             .list(PathBuf::new())
             .wait()?
             .iter()
@@ -791,8 +817,7 @@ impl Repo {
             })
             .filter_map(|item| match Generation::try_from(item) {
                 Ok(gen) => {
-                    if self.aio.read_metadata(gen.config_path()).wait().is_ok()
-                    {
+                    if aio.read_metadata(gen.config_path()).wait().is_ok() {
                         Some(gen)
                     } else {
                         warn!(
@@ -829,13 +854,14 @@ impl Repo {
         R: Read + Send,
     {
         info!(self.log, "Writing data"; "name" => name_str);
-        let _lock = self.aio.lock_shared()?;
+        let operation = (self.backend_select)()?.begin_shared()?;
+        let aio = aio::AsyncIO::new(operation.clone(), self.log.clone())?;
 
-        let mut generations = self.read_generations()?;
+        let mut generations = self.read_generations(&aio)?;
 
         if generations.is_empty() {
             let gen_first = Generation::gen_first();
-            gen_first.write(&self.aio)?;
+            gen_first.write(&aio)?;
             generations.push(gen_first);
         }
 
@@ -849,10 +875,9 @@ impl Repo {
         let (chunker_tx, chunker_rx) =
             mpsc::sync_channel(self.write_cpu_thread_num());
 
-        let backend = (self.backend_select)()?;
-        let aio = aio::AsyncIO::new(backend, self.log.clone())?;
+        let write_aio = aio::AsyncIO::new(operation, self.log.clone())?;
 
-        let stats = aio.stats();
+        let stats = write_aio.stats();
 
         // mpmc queue used  as spmc fan-out
         let (process_tx, process_rx) = crossbeam_channel::bounded(num_threads);
@@ -862,7 +887,7 @@ impl Repo {
 
             for _ in 0..num_threads {
                 let process_rx = process_rx.clone();
-                let aio = aio.clone();
+                let aio = write_aio.clone();
                 let encrypter = Arc::clone(&enc.encrypter);
                 let compression = Arc::clone(&self.compression);
                 let hasher = Arc::clone(&self.hasher);
@@ -886,7 +911,7 @@ impl Repo {
                 self.chunk_and_write_data_thread(
                     Box::new(chunker_rx.into_iter()),
                     process_tx,
-                    aio,
+                    write_aio,
                     DataType::Data,
                 )
             });
@@ -904,7 +929,7 @@ impl Repo {
         })?;
 
         let name: Name = data_address?.into();
-        name.write_as(name_str, *generations.last().unwrap(), &self.aio)?;
+        name.write_as(name_str, *generations.last().unwrap(), &aio)?;
         Ok(stats.get_stats())
     }
 }

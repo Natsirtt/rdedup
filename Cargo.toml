@@ -45,6 +45,9 @@ debug-assertions = false
 [workspace]
 members = [ "tester" ]
 
+[workspace.dependencies]
+thiserror = "2"
+
 [dependencies]
 # Default features disabled so they can be explicitly opted into
 rdedup-lib = { version = "3.2.0", path = "lib", default-features = false }

@@ -32,9 +32,11 @@ fn rand_tmp_dir() -> PathBuf {
 }
 
 fn list_stored_chunks(repo: &lib::Repo) -> Result<HashSet<Vec<u8>>> {
+    let operation = (repo.backend_select)()?.begin_shared()?;
+    let aio = crate::aio::AsyncIO::new(operation, repo.log.clone())?;
     let mut digests = HashSet::new();
     let data_chunks = StoredChunks::new(
-        &repo.aio,
+        &aio,
         PathBuf::from("."),
         DIGEST_SIZE,
         repo.log.clone(),
@@ -336,7 +338,13 @@ fn verify_name() {
     assert_eq!(result.errors.len(), 0);
 
     // Corrupt first chunk we find
-    let generations = repo.read_generations().unwrap();
+    let generations = {
+        let operation =
+            (repo.backend_select)().unwrap().begin_shared().unwrap();
+        let aio =
+            crate::aio::AsyncIO::new(operation, repo.log.clone()).unwrap();
+        repo.read_generations(&aio).unwrap()
+    };
 
     let chunk_path = dir.join(generations[0].to_string()).join("chunk");
     for l1 in fs::read_dir(&chunk_path).unwrap() {
@@ -530,41 +538,34 @@ fn test_readerveciter() {
     assert!(while_ok.finish().is_some());
 }
 
-struct FailingLockBackend {
-    repository_path: PathBuf,
-}
+struct FailingLockBackend;
 
 impl lib::backends::Backend for FailingLockBackend {
-    fn lock_exclusive(&self) -> io::Result<Box<dyn lib::backends::Lock>> {
+    fn begin_exclusive(
+        &self,
+    ) -> io::Result<lib::backends::BackendOperation<lib::backends::Exclusive>>
+    {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "lock denied",
         ))
     }
 
-    fn lock_shared(&self) -> io::Result<Box<dyn lib::backends::Lock>> {
+    fn begin_shared(
+        &self,
+    ) -> io::Result<lib::backends::BackendOperation<lib::backends::Shared>>
+    {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "lock denied",
         ))
-    }
-
-    fn new_thread(&self) -> io::Result<Box<dyn lib::backends::BackendThread>> {
-        lib::backends::local::Local::new(self.repository_path.clone())
-            .new_thread()
     }
 }
 
 fn repo_with_failing_locks() -> lib::Repo {
-    let repository_path = rand_tmp_dir();
-    let backend = Arc::new(move || {
-        Ok(Box::new(FailingLockBackend {
-            repository_path: repository_path.clone(),
-        }) as Box<dyn lib::backends::Backend + Send + Sync>)
-    });
-    let mut settings = settings::Repo::new();
-    settings.set_pwhash(settings::PWHash::Weak);
-    lib::Repo::init(backend, &|| Ok(PASS.into()), settings, None).unwrap()
+    let mut repository = test_repo(PASS);
+    repository.backend_select = Arc::new(|| Ok(Box::new(FailingLockBackend)));
+    repository
 }
 
 #[test]
@@ -637,5 +638,41 @@ fn conflicting_name_write_preserves_the_original_contents() {
         .unwrap();
     assert_eq!(stored_data, original_data);
 
+    wipe(&repository);
+}
+
+#[test]
+fn reading_a_legacy_name_does_not_rewrite_it() {
+    let (repository, directory) = test_repo_dir(PASS);
+    let encryption = repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+    let decryption = repository.unlock_decrypt(&|| Ok(PASS.into())).unwrap();
+    repository
+        .write("legacy", io::Cursor::new(b"archive bytes"), &encryption)
+        .unwrap();
+    let operation = (repository.backend_select)()
+        .unwrap()
+        .begin_shared()
+        .unwrap();
+    let aio =
+        crate::aio::AsyncIO::new(operation, repository.log.clone()).unwrap();
+    let generations = repository.read_generations(&aio).unwrap();
+    let path = directory.join(crate::name::Name::path(
+        "legacy",
+        *generations.last().unwrap(),
+    ));
+    drop(aio);
+    let mut name: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(&path).unwrap()).unwrap();
+    name.as_mapping_mut()
+        .unwrap()
+        .remove(serde_yaml::Value::String("created".into()));
+    let legacy = serde_yaml::to_string(&name).unwrap();
+    fs::write(&path, &legacy).unwrap();
+    let mut contents = Vec::new();
+    repository
+        .read("legacy", &mut contents, &decryption)
+        .unwrap();
+    assert_eq!(contents, b"archive bytes");
+    assert_eq!(fs::read_to_string(&path).unwrap(), legacy);
     wipe(&repository);
 }

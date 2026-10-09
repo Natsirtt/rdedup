@@ -1,5 +1,8 @@
+use super::backend::ProtectedThread;
 use crate::aio::{Local, Metadata};
-use crate::backends::{Backend, BackendThread, Lock};
+use crate::backends::{
+    Backend, BackendOperation, BackendThread, Exclusive, OperationState, Shared,
+};
 use sgdata::SGData;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -9,22 +12,23 @@ pub struct LocalCache {
     remote: Box<dyn Backend>,
 }
 
-struct CombinedLocks {
-    #[allow(dead_code)]
-    locks: Vec<Box<dyn Lock>>,
+struct CacheOperation {
+    local: BackendOperation<Shared>,
+    remote: BackendOperation<Shared>,
 }
 
-impl CombinedLocks {
-    fn new(locks: Vec<Box<dyn Lock>>) -> Self {
-        CombinedLocks { locks }
+impl OperationState for CacheOperation {
+    fn new_thread(&self) -> std::io::Result<Box<dyn BackendThread>> {
+        Ok(Box::new(LocalCacheThread {
+            local: self.local.new_thread()?.into_protected_thread(),
+            remote: self.remote.new_thread()?.into_protected_thread(),
+        }))
     }
 }
 
-impl Lock for CombinedLocks {}
-
 pub struct LocalCacheThread {
-    local: Box<dyn BackendThread>,
-    remote: Box<dyn BackendThread>,
+    local: ProtectedThread,
+    remote: ProtectedThread,
 }
 
 impl LocalCache {
@@ -37,40 +41,54 @@ impl LocalCache {
 }
 
 impl Backend for LocalCache {
-    fn lock_exclusive(&self) -> std::io::Result<Box<dyn Lock>> {
-        let remote_lock = self.remote.lock_exclusive()?;
-        let local_lock = self.local.lock_exclusive()?;
-        Ok(Box::new(CombinedLocks::new(vec![remote_lock, local_lock])))
+    fn begin_exclusive(&self) -> std::io::Result<BackendOperation<Exclusive>> {
+        let remote = self.remote.begin_exclusive()?;
+        let local = self.local.begin_exclusive()?;
+        Ok(BackendOperation::new(CacheOperation {
+            local: local.shared(),
+            remote: remote.shared(),
+        }))
     }
 
-    fn lock_shared(&self) -> std::io::Result<Box<dyn Lock>> {
-        let remote_lock = self.remote.lock_shared()?;
-        // We lock the local cache with an exclusive lock because any read cache miss will trigger
-        // a write operation to the local cache to cache the remotely-read chunk. Currently, the
-        // lock cannot be acquired and released granularly only when needed. This makes a cache-repo
-        // unable to be used even in read-only mode concurrently as of the current implementation.
-        let local_lock = self.local.lock_exclusive()?;
-        Ok(Box::new(CombinedLocks::new(vec![remote_lock, local_lock])))
-    }
-
-    fn new_thread(&self) -> std::io::Result<Box<dyn BackendThread>> {
-        let local_thread = self.local.new_thread()?;
-        let remote_thread = self.remote.new_thread()?;
-        Ok(Box::new(LocalCacheThread {
-            local: local_thread,
-            remote: remote_thread,
+    fn begin_shared(&self) -> std::io::Result<BackendOperation<Shared>> {
+        let remote = self.remote.begin_shared()?;
+        // Cache misses populate local storage; exclusive local protection also
+        // excludes local cache maintenance until this operation finishes.
+        let local = self.local.begin_exclusive()?;
+        Ok(BackendOperation::new(CacheOperation {
+            local: local.shared(),
+            remote,
         }))
     }
 }
 
 impl BackendThread for LocalCacheThread {
+    fn promote_chunk(
+        &mut self,
+        promotion: super::promotion::ChunkPromotion,
+    ) -> std::io::Result<()> {
+        self.remote.thread.promote_chunk(promotion.clone())?;
+        // Cache entries are optional; only promote a locally present source.
+        match self
+            .local
+            .thread
+            .read_metadata(promotion.source_path().to_path_buf())
+        {
+            Ok(_) => self.local.thread.promote_chunk(promotion),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     // We generally delegate the write operation to the remote store first; and then duplicate them locally if it succeeded only.
     // Read operations try to hit the local cache first, and delegate to the remote on error (assuming there was no cached value).
 
     fn remove_dir_all(&mut self, path: PathBuf) -> std::io::Result<()> {
-        let result = self.remote.remove_dir_all(path.clone());
+        let result = self.remote.thread.remove_dir_all(path.clone());
         match result {
-            Ok(()) => self.local.remove_dir_all(path),
+            Ok(()) => self.local.thread.remove_dir_all(path),
             Err(e) => Err(e),
         }
     }
@@ -80,9 +98,12 @@ impl BackendThread for LocalCacheThread {
         src_path: PathBuf,
         dst_path: PathBuf,
     ) -> std::io::Result<()> {
-        let result = self.remote.rename(src_path.clone(), dst_path.clone());
+        let result = self
+            .remote
+            .thread
+            .rename(src_path.clone(), dst_path.clone());
         match result {
-            Ok(()) => self.local.rename(src_path, dst_path),
+            Ok(()) => self.local.thread.rename(src_path, dst_path),
             Err(e) => Err(e),
         }
     }
@@ -93,23 +114,26 @@ impl BackendThread for LocalCacheThread {
         sg: SGData,
         idempotent: bool,
     ) -> std::io::Result<()> {
-        let result = self.remote.write(path.clone(), sg.clone(), idempotent);
+        let result =
+            self.remote
+                .thread
+                .write(path.clone(), sg.clone(), idempotent);
         match result {
-            Ok(()) => self.local.write(path, sg, idempotent),
+            Ok(()) => self.local.thread.write(path, sg, idempotent),
             Err(e) => Err(e),
         }
     }
 
     fn read(&mut self, path: PathBuf) -> std::io::Result<SGData> {
-        let result = self.local.read(path.clone());
+        let result = self.local.thread.read(path.clone());
         match result {
             Ok(data) => Ok(data),
             Err(_) => {
                 // TODO: check if different errors can occur, and only fetch from remote when it's an expected "no such file" or similar error?
-                match self.remote.read(path.clone()) {
+                match self.remote.thread.read(path.clone()) {
                     Ok(data) => {
                         let cache_result =
-                            self.local.write(path, data.clone(), false);
+                            self.local.thread.write(path, data.clone(), false);
                         if cache_result.is_err() {
                             // Return an Err anyway? Or how can we both soft-report and error without critically failing since
                             // technically we do have the data. Anything better than eprintln?
@@ -124,20 +148,20 @@ impl BackendThread for LocalCacheThread {
     }
 
     fn remove(&mut self, path: PathBuf) -> std::io::Result<()> {
-        let result = self.remote.remove(path.clone());
+        let result = self.remote.thread.remove(path.clone());
         match result {
-            Ok(()) => self.local.remove(path),
+            Ok(()) => self.local.thread.remove(path),
             Err(e) => Err(e),
         }
     }
 
     fn read_metadata(&mut self, path: PathBuf) -> std::io::Result<Metadata> {
-        self.remote.read_metadata(path.clone())
+        self.remote.thread.read_metadata(path.clone())
     }
 
     // Simply rely on the remote as the ground truth for listing
     fn list(&mut self, path: PathBuf) -> std::io::Result<Vec<PathBuf>> {
-        self.remote.list(path)
+        self.remote.thread.list(path)
     }
 
     fn list_recursively(
@@ -145,6 +169,6 @@ impl BackendThread for LocalCacheThread {
         path: PathBuf,
         tx: Sender<std::io::Result<Vec<PathBuf>>>,
     ) {
-        self.remote.list_recursively(path, tx)
+        self.remote.thread.list_recursively(path, tx)
     }
 }

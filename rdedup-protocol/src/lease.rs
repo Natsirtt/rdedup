@@ -125,7 +125,8 @@ pub enum Acquisition {
         /// Protection and timing for the admitted operation.
         lease: LeaseGrant,
     },
-    /// The request was cancelled or expired and cannot be acquired again.
+    /// The retained request was cancelled or expired. Clients start a new
+    /// attempt with a fresh request identity, never reuse a terminal one.
     Closed,
 }
 

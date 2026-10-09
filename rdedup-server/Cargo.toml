@@ -1,0 +1,17 @@
+[package]
+name = "rdedup-server"
+version = "3.2.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Writable HTTP repository service for rdedup"
+
+[dependencies]
+rdedup-protocol = { path = "../rdedup-protocol" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+fs2 = { workspace = true }
+rdedup-lib = { path = "../lib", default-features = false }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }

@@ -12,6 +12,7 @@ use std::io::Read;
 use std::io::Write;
 use std::sync::Arc;
 
+#[cfg(feature = "with-zstd")]
 use owning_ref::ArcRef;
 use sgdata::SGData;
 
@@ -188,12 +189,14 @@ impl Zstd {
     }
 }
 
+#[cfg(feature = "with-zstd")]
 struct SGReader<'a> {
     parts: &'a [ArcRef<Vec<u8>, [u8]>],
     parts_i: usize,
     part_offset: usize,
 }
 
+#[cfg(feature = "with-zstd")]
 impl<'a> SGReader<'a> {
     fn new(parts: &'a SGData) -> Self {
         SGReader {
@@ -204,6 +207,7 @@ impl<'a> SGReader<'a> {
     }
 }
 
+#[cfg(feature = "with-zstd")]
 impl Read for SGReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {

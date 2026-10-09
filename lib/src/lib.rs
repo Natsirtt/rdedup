@@ -810,15 +810,13 @@ impl Repo {
             })
             .filter_map(|item| match Generation::try_from(item) {
                 Ok(gen) => {
-                    if aio.read_metadata(gen.config_path()).wait().is_ok() {
-                        Some(gen)
-                    } else {
-                        warn!(
-                            self.log,
-                            "skipping dead generation: `{}` (config missing)",
-                            item,
-                        );
-                        None
+                    match aio.read_metadata(gen.config_path()).wait() {
+                        Ok(_) => Some(Ok(gen)),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            warn!(self.log, "skipping dead generation: `{}` (config missing)", item);
+                            None
+                        }
+                        Err(error) => Some(Err(error)),
                     }
                 }
                 Err(e) => {
@@ -831,7 +829,7 @@ impl Repo {
                     None
                 }
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
 
         list.sort();
         Ok(list)
@@ -919,7 +917,7 @@ impl Repo {
 
         drop(write_aio);
         let name: Name = data_address.into();
-        name.write_as(name_str, *generations.last().unwrap(), &aio)?;
+        name.write_as(name_str, &generations, &aio)?;
         Ok(stats.get_stats())
     }
 }

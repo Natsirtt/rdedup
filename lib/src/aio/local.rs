@@ -27,7 +27,8 @@ pub struct Local {
 
 mod stream;
 pub use stream::{
-    Error as StreamError, PendingObject, Publication, StoredObject,
+    Error as StreamError, PendingObject, PreparedObject, Publication,
+    StoredObject,
 };
 
 #[derive(Debug)]
@@ -109,6 +110,14 @@ impl<Access> LocalOperation<Access> {
 }
 
 impl LocalOperation<Exclusive> {
+    /// Restrict stream capabilities while retaining the exclusive OS lock.
+    pub fn shared(&self) -> LocalOperation<Shared> {
+        LocalOperation {
+            protection: Arc::clone(&self.protection),
+            access: PhantomData,
+        }
+    }
+
     /// Stage a replacement while retaining exclusive repository protection.
     ///
     /// # Errors
@@ -126,6 +135,42 @@ impl LocalOperation<Exclusive> {
 }
 
 impl Local {
+    /// Try shared protection without blocking behind an exclusive operation.
+    ///
+    /// # Errors
+    /// Returns a filesystem failure or the operating system's lock-contention
+    /// error when another operation owns incompatible protection.
+    pub fn try_shared_operation(&self) -> io::Result<LocalOperation<Shared>> {
+        let file = self.open_lock_file()?;
+        fs2::FileExt::try_lock_shared(&file)?;
+        Ok(LocalOperation {
+            protection: Arc::new(LocalProtection {
+                path: self.path.clone(),
+                _lock: file,
+            }),
+            access: PhantomData,
+        })
+    }
+
+    /// Try exclusive protection without blocking the lease coordinator.
+    ///
+    /// # Errors
+    /// Returns a filesystem failure or the operating system's lock-contention
+    /// error while any incompatible operation or stream retains protection.
+    pub fn try_exclusive_operation(
+        &self,
+    ) -> io::Result<LocalOperation<Exclusive>> {
+        let file = self.open_lock_file()?;
+        fs2::FileExt::try_lock_exclusive(&file)?;
+        Ok(LocalOperation {
+            protection: Arc::new(LocalProtection {
+                path: self.path.clone(),
+                _lock: file,
+            }),
+            access: PhantomData,
+        })
+    }
+
     /// Acquire shared protection for streamed reads and additive writes.
     ///
     /// # Errors
@@ -390,6 +435,31 @@ mod tests {
             let entry = entry.unwrap();
             assert!(!entry.file_name().to_string_lossy().ends_with(".tmp"));
         }
+    }
+
+    #[test]
+    fn synchronized_staging_retains_protection_until_publication_or_cancellation(
+    ) {
+        use std::io::Write;
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let operation = backend.try_shared_operation().unwrap();
+        let mut pending = operation
+            .create_object(std::path::Path::new("object"))
+            .unwrap();
+        pending.write_all(b"complete").unwrap();
+        let prepared = pending.synchronize().unwrap();
+        drop(operation);
+        assert!(backend.try_exclusive_operation().is_err());
+        assert!(!directory.0.join("object").exists());
+        assert_eq!(prepared.publish().unwrap(), super::Publication::Published);
+        assert_eq!(fs::read(directory.0.join("object")).unwrap(), b"complete");
+        let exclusive = backend.try_exclusive_operation().unwrap();
+        let restricted = exclusive.shared();
+        drop(exclusive);
+        assert!(backend.try_shared_operation().is_err());
+        drop(restricted);
+        assert!(backend.try_shared_operation().is_ok());
     }
 
     #[test]

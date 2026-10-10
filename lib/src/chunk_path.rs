@@ -83,6 +83,38 @@ impl ChunkPath {
     }
 }
 
+/// Admit a generation's chunk root or a canonical sequence of nesting prefixes.
+pub(crate) fn validate_directory(path: &Path) -> Result<(), Error> {
+    let invalid = || Error::InvalidLocation {
+        path: path.to_owned(),
+    };
+    let parts = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => part.to_str().ok_or_else(invalid),
+            _ => Err(invalid()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let [generation, namespace, prefixes @ ..] = parts.as_slice() else {
+        return Err(invalid());
+    };
+    let parsed = Generation::try_from(generation).map_err(|_| invalid())?;
+    if parsed.to_string() != *generation
+        || *namespace != config::DATA_SUBDIR
+        || prefixes.len() >= DIGEST_SIZE
+    {
+        return Err(invalid());
+    }
+    for prefix in prefixes {
+        let mut byte = [0];
+        hex::decode_to_slice(prefix, &mut byte).map_err(Error::Digest)?;
+        if hex::encode(byte) != *prefix {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

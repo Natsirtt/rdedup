@@ -53,6 +53,7 @@ use self::name::*;
 
 mod chunk_path;
 mod misc;
+mod repository_path;
 use self::misc::*;
 // }}}
 
@@ -66,6 +67,9 @@ pub mod backends {
     pub use crate::aio::promotion::{ChunkPromotion, Error as PromotionError};
     pub use crate::aio::Metadata;
     pub use crate::chunk_path::{ChunkPath, Error as ChunkPathError};
+    pub use crate::repository_path::{
+        DirectoryPath, Error as RepositoryPathError, ObjectPath,
+    };
     use std::io;
     use url::Url;
 

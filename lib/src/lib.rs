@@ -51,6 +51,7 @@ use self::generation::*;
 mod name;
 use self::name::*;
 
+mod chunk_path;
 mod misc;
 use self::misc::*;
 // }}}
@@ -64,6 +65,7 @@ pub mod backends {
     };
     pub use crate::aio::promotion::{ChunkPromotion, Error as PromotionError};
     pub use crate::aio::Metadata;
+    pub use crate::chunk_path::{ChunkPath, Error as ChunkPathError};
     use std::io;
     use url::Url;
 
@@ -152,7 +154,7 @@ pub struct EncryptHandle {
 /// Rdedup repository handle
 #[derive(Clone)]
 pub struct Repo {
-    backend_select: Arc<BackendSelectFn>,
+    backend: Arc<dyn backends::Backend + Send + Sync>,
     config: config::Repo,
 
     compression: compression::ArcCompression,
@@ -243,7 +245,8 @@ impl Repo {
             .into()
             .unwrap_or_else(|| Logger::root(slog::Discard, o!()));
 
-        let backend = backend_select()?;
+        let backend: Arc<dyn backends::Backend + Send + Sync> =
+            backend_select()?.into();
         let operation = backend.begin_exclusive()?;
         let aio = aio::ExclusiveAsyncIO::new(operation, log.clone())?;
 
@@ -255,7 +258,7 @@ impl Repo {
         let hasher = config.hashing.to_hasher();
 
         Ok(Repo {
-            backend_select,
+            backend,
             config,
             compression,
             hasher,
@@ -272,7 +275,8 @@ impl Repo {
             .into()
             .unwrap_or_else(|| Logger::root(slog::Discard, o!()));
 
-        let backend = backend_select()?;
+        let backend: Arc<dyn backends::Backend + Send + Sync> =
+            backend_select()?.into();
         let operation = backend.begin_shared()?;
         let aio = aio::AsyncIO::new(operation, log.clone())?;
 
@@ -281,7 +285,7 @@ impl Repo {
         let compression = config.compression.to_engine();
         let hasher = config.hashing.to_hasher();
         Ok(Repo {
-            backend_select,
+            backend,
             config,
             compression,
             hasher,
@@ -295,7 +299,7 @@ impl Repo {
         old_p: PassphraseFn<'_>,
         new_p: PassphraseFn<'_>,
     ) -> Result<()> {
-        let operation = (self.backend_select)()?.begin_exclusive()?;
+        let operation = self.backend.begin_exclusive()?;
         let aio = aio::ExclusiveAsyncIO::new(operation, self.log.clone())?;
 
         if self.config.version == 0 {
@@ -599,7 +603,7 @@ impl Repo {
     /// Return all reachable chunks
     #[allow(dead_code)] // tests
     fn list_reachable_chunks(&self) -> Result<HashSet<Vec<u8>>> {
-        let operation = (self.backend_select)()?.begin_shared()?;
+        let operation = self.backend.begin_shared()?;
         let aio = aio::AsyncIO::new(operation, self.log.clone())?;
         let generations = self.read_generations(&aio)?;
         let mut reachable_digests = HashSet::new();
@@ -642,20 +646,20 @@ impl Repo {
     }
 
     pub fn list_names(&self) -> io::Result<Vec<String>> {
-        let operation = (self.backend_select)()?.begin_shared()?;
+        let operation = self.backend.begin_shared()?;
         let aio = aio::AsyncIO::new(operation, self.log.clone())?;
         Name::list_all(&self.read_generations(&aio)?, &aio)
     }
 
     /// Remove a stored name from repo
     pub fn rm(&self, name: &str) -> Result<()> {
-        let operation = (self.backend_select)()?.begin_exclusive()?;
+        let operation = self.backend.begin_exclusive()?;
         let aio = aio::ExclusiveAsyncIO::new(operation, self.log.clone())?;
         Name::remove_any(name, &self.read_generations(aio.shared())?, &aio)
     }
 
     pub fn gc(&self, min_age_secs: u64) -> Result<()> {
-        let operation = (self.backend_select)()?.begin_exclusive()?;
+        let operation = self.backend.begin_exclusive()?;
         let aio = aio::ExclusiveAsyncIO::new(operation, self.log.clone())?;
 
         let generations = self.read_generations(aio.shared())?;
@@ -713,7 +717,7 @@ impl Repo {
         writer: &mut W,
         dec: &DecryptHandle,
     ) -> Result<()> {
-        let operation = (self.backend_select)()?.begin_shared()?;
+        let operation = self.backend.begin_shared()?;
         let aio = aio::AsyncIO::new(operation, self.log.clone())?;
 
         let generations = self.read_generations(&aio)?;
@@ -737,7 +741,7 @@ impl Repo {
     }
 
     pub fn du(&self, name_str: &str, dec: &DecryptHandle) -> Result<DuResults> {
-        let operation = (self.backend_select)()?.begin_shared()?;
+        let operation = self.backend.begin_shared()?;
         let aio = aio::AsyncIO::new(operation, self.log.clone())?;
 
         let generations = self.read_generations(&aio)?;
@@ -772,7 +776,7 @@ impl Repo {
         name_str: &str,
         dec: &DecryptHandle,
     ) -> Result<VerifyResults> {
-        let operation = (self.backend_select)()?.begin_shared()?;
+        let operation = self.backend.begin_shared()?;
         let aio = aio::AsyncIO::new(operation, self.log.clone())?;
 
         let generations = self.read_generations(&aio)?;
@@ -848,7 +852,7 @@ impl Repo {
         R: Read + Send,
     {
         info!(self.log, "Writing data"; "name" => name_str);
-        let operation = (self.backend_select)()?.begin_shared()?;
+        let operation = self.backend.begin_shared()?;
         let aio = aio::AsyncIO::new(operation.clone(), self.log.clone())?;
 
         let mut generations = self.read_generations(&aio)?;

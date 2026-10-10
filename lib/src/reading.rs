@@ -304,7 +304,7 @@ impl ChunkAccessor for DefaultChunkAccessor<'_> {
             let res = self
                 .aio
                 .promote_chunk(
-                    crate::backends::ChunkPromotion::new(
+                    crate::backends::ChunkPromotion::from_paths(
                         data_gen_path.clone(),
                         cur_gen_path.clone(),
                     )
@@ -550,7 +550,7 @@ impl ChunkAccessor for GenerationUpdateChunkAccessor<'_> {
                 .raw
                 .aio
                 .promote_chunk(
-                    crate::backends::ChunkPromotion::new(
+                    crate::backends::ChunkPromotion::from_paths(
                         data_gen_path.clone(),
                         cur_gen_path.clone(),
                     )

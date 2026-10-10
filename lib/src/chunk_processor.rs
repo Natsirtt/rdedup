@@ -160,17 +160,20 @@ impl ChunkProcessor {
                         });
                     }
                     if path != destination {
-                        let promotion = crate::backends::ChunkPromotion::new(
-                            path,
-                            destination.clone(),
-                        )
-                        .map_err(|error| Error::Promotion {
-                            path: destination.clone(),
-                            source: io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                error,
-                            ),
-                        })?;
+                        let promotion =
+                            crate::backends::ChunkPromotion::from_paths(
+                                path,
+                                destination.clone(),
+                            )
+                            .map_err(|error| {
+                                Error::Promotion {
+                                    path: destination.clone(),
+                                    source: io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        error,
+                                    ),
+                                }
+                            })?;
                         self.aio.promote_chunk(promotion).wait().map_err(
                             |source| Error::Promotion {
                                 path: destination.clone(),

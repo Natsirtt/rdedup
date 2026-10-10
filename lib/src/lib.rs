@@ -52,6 +52,7 @@ use self::generation::*;
 mod name;
 use self::name::*;
 
+mod chunk_path;
 mod misc;
 use self::misc::*;
 // }}}
@@ -65,6 +66,7 @@ pub mod backends {
     };
     pub use crate::aio::promotion::{ChunkPromotion, Error as PromotionError};
     pub use crate::aio::Metadata;
+    pub use crate::chunk_path::{ChunkPath, Error as ChunkPathError};
     use std::io;
     use url::Url;
 

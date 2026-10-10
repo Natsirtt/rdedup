@@ -32,7 +32,7 @@ fn rand_tmp_dir() -> PathBuf {
 }
 
 fn list_stored_chunks(repo: &lib::Repo) -> Result<HashSet<Vec<u8>>> {
-    let operation = (repo.backend_select)()?.begin_shared()?;
+    let operation = repo.backend.begin_shared()?;
     let aio = crate::aio::AsyncIO::new(operation, repo.log.clone())?;
     let mut digests = HashSet::new();
     let data_chunks = StoredChunks::new(
@@ -339,8 +339,7 @@ fn verify_name() {
 
     // Corrupt first chunk we find
     let generations = {
-        let operation =
-            (repo.backend_select)().unwrap().begin_shared().unwrap();
+        let operation = repo.backend.begin_shared().unwrap();
         let aio =
             crate::aio::AsyncIO::new(operation, repo.log.clone()).unwrap();
         repo.read_generations(&aio).unwrap()
@@ -564,7 +563,7 @@ impl lib::backends::Backend for FailingLockBackend {
 
 fn repo_with_failing_locks() -> lib::Repo {
     let mut repository = test_repo(PASS);
-    repository.backend_select = Arc::new(|| Ok(Box::new(FailingLockBackend)));
+    repository.backend = Arc::new(FailingLockBackend);
     repository
 }
 
@@ -649,10 +648,7 @@ fn reading_a_legacy_name_does_not_rewrite_it() {
     repository
         .write("legacy", io::Cursor::new(b"archive bytes"), &encryption)
         .unwrap();
-    let operation = (repository.backend_select)()
-        .unwrap()
-        .begin_shared()
-        .unwrap();
+    let operation = repository.backend.begin_shared().unwrap();
     let aio =
         crate::aio::AsyncIO::new(operation, repository.log.clone()).unwrap();
     let generations = repository.read_generations(&aio).unwrap();
@@ -675,4 +671,28 @@ fn reading_a_legacy_name_does_not_rewrite_it() {
     assert_eq!(contents, b"archive bytes");
     assert_eq!(fs::read_to_string(&path).unwrap(), legacy);
     wipe(&repository);
+}
+
+#[test]
+fn a_repository_reuses_its_backend_across_operations_and_clones() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = rand_tmp_dir();
+    let selections = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&selections);
+    let selected_directory = directory.clone();
+    let select: Arc<lib::BackendSelectFn> = Arc::new(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(lib::backends::local::Local::new(
+            selected_directory.clone(),
+        )))
+    });
+    let mut settings = settings::Repo::new();
+    settings.set_pwhash(settings::PWHash::Weak);
+    let repository =
+        lib::Repo::init(select, &|| Ok(PASS.into()), settings, None).unwrap();
+    repository.list_names().unwrap();
+    repository.clone().list_names().unwrap();
+    assert_eq!(selections.load(Ordering::SeqCst), 1);
+    drop(repository);
+    fs::remove_dir_all(directory).unwrap();
 }

@@ -696,3 +696,55 @@ fn a_repository_reuses_its_backend_across_operations_and_clones() {
     drop(repository);
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn cache_population_uses_shared_protection_and_preserves_storage_errors() {
+    use lib::backends::{local::Local, local_cache::LocalCache, Backend};
+    use sgdata::SGData;
+    let cache_directory = rand_tmp_dir();
+    let remote_directory = rand_tmp_dir();
+    let remote = Local::new(remote_directory.clone());
+    let operation = remote.begin_shared().unwrap();
+    let mut worker = operation.new_thread().unwrap();
+    worker
+        .create(
+            "object".into(),
+            SGData::from_single(b"stored bytes".to_vec()),
+        )
+        .unwrap();
+    worker
+        .create(
+            "broken".into(),
+            SGData::from_single(b"remote fallback".to_vec()),
+        )
+        .unwrap();
+    drop(worker);
+    drop(operation);
+    let cache = LocalCache::new(cache_directory.clone(), Box::new(remote));
+    let operation = cache.begin_shared().unwrap();
+    let observer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(cache_directory.join(".lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_shared(&observer).unwrap();
+    fs2::FileExt::unlock(&observer).unwrap();
+    assert!(fs2::FileExt::try_lock_exclusive(&observer).is_err());
+    let mut worker = operation.new_thread().unwrap();
+    assert_eq!(
+        worker.read("object".into()).unwrap().into_linear_vec(),
+        b"stored bytes"
+    );
+    assert_eq!(
+        fs::read(cache_directory.join("object")).unwrap(),
+        b"stored bytes"
+    );
+    fs::create_dir(cache_directory.join("broken")).unwrap();
+    assert!(worker.read("broken".into()).is_err());
+    drop(worker);
+    drop(operation);
+    drop(observer);
+    drop(cache);
+    fs::remove_dir_all(cache_directory).unwrap();
+    fs::remove_dir_all(remote_directory).unwrap();
+}

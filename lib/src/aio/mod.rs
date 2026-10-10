@@ -267,7 +267,7 @@ impl ExclusiveAsyncIO {
         &self.shared
     }
 
-    pub fn write(&self, path: PathBuf, sg: SGData) -> AsyncIOResult<()> {
+    pub fn replace(&self, path: PathBuf, sg: SGData) -> AsyncIOResult<()> {
         let (tx, rx) = mpsc::channel();
         self.shared
             .tx
@@ -277,7 +277,7 @@ impl ExclusiveAsyncIO {
                 idempotent: false,
                 complete_tx: Some(tx),
             }))
-            .expect("aio tx closed: write");
+            .expect("aio tx closed: replace");
         AsyncIOResult { rx }
     }
 

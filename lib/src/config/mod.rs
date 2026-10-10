@@ -177,7 +177,7 @@ impl Repo {
         let config_str =
             serde_yaml::to_string(self).expect("yaml serialization failed");
 
-        aio.write(
+        aio.replace(
             CONFIG_YML_FILE.into(),
             SGData::from_single(config_str.into_bytes()),
         )

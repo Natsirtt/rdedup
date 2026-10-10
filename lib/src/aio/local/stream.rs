@@ -165,6 +165,14 @@ impl PendingObject {
     /// Returns synchronization or publication failures. An existing destination
     /// is retained for create operations and reported as `AlreadyExists`.
     pub fn commit(self) -> Result<Publication, Error> {
+        self.synchronize()?.publish()
+    }
+
+    /// Finish file I/O without publishing, allowing a final lease check.
+    ///
+    /// # Errors
+    /// Returns a synchronization failure; cancellation cleans the temporary entry.
+    pub fn synchronize(self) -> Result<PreparedObject, Error> {
         let Self {
             file,
             staging,
@@ -178,6 +186,33 @@ impl PendingObject {
             path: destination.clone(),
             source,
         })?;
+        Ok(PreparedObject {
+            staging,
+            destination,
+            mode,
+        })
+    }
+}
+
+/// Synchronized, closed staging entry retaining its repository protection.
+/// Dropping it cancels publication and removes the temporary entry.
+pub struct PreparedObject {
+    staging: StagedEntry,
+    destination: PathBuf,
+    mode: PublicationMode,
+}
+
+impl PreparedObject {
+    /// Atomically publish the synchronized entry without another file-data wait.
+    ///
+    /// # Errors
+    /// Returns a publication failure; an existing create destination is retained.
+    pub fn publish(self) -> Result<Publication, Error> {
+        let Self {
+            staging,
+            destination,
+            mode,
+        } = self;
         let result = match mode {
             PublicationMode::Create => {
                 match fs::hard_link(&staging.temporary.0, &destination) {

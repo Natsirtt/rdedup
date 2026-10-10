@@ -109,10 +109,10 @@ impl ChunkProcessor {
                                         gen_strings.last().unwrap(),
                                     );
                                 self.aio
-                                    .rename(
+                                    .promote_chunk(crate::backends::ChunkPromotion::from_paths(
                                         chunk_path.clone(),
                                         dst_path.clone(),
-                                    )
+                                    ).expect("paths identify the same digest in strictly ordered generations"))
                                     .wait()
                                     .unwrap_or_else(|_e| {
                                         // chunk might have been upated

@@ -4,19 +4,18 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::{fs, io, mem};
 
-use fs2::FileExt;
 use rand::distr::Alphanumeric;
 use rand::Rng;
 use sgdata::SGData;
 use walkdir::WalkDir;
 
-use super::{Backend, BackendThread};
-use super::{Lock, Metadata};
+use super::backend::{
+    Backend, BackendOperation, BackendThread, Exclusive, OperationState, Shared,
+};
+use super::Metadata;
 use crate::config;
 use crate::INGRESS_BUFFER_SIZE;
 // }}}
-
-impl Lock for fs::File {}
 
 pub(crate) fn lock_file_path(path: &Path) -> PathBuf {
     path.join(config::LOCK_FILE)
@@ -33,48 +32,92 @@ pub struct LocalThread {
     rand_ext: String,
 }
 
+struct LocalOperation {
+    path: PathBuf,
+    _lock: fs::File,
+}
+
 impl Backend for Local {
-    fn lock_exclusive(&self) -> io::Result<Box<dyn Lock>> {
-        let lock_path = lock_file_path(&self.path);
-
-        let file = fs::File::create(&lock_path)?;
-        file.lock_exclusive()?;
-
-        Ok(Box::new(file))
+    fn begin_exclusive(&self) -> io::Result<BackendOperation<Exclusive>> {
+        let file = self.open_lock_file()?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(BackendOperation::new(LocalOperation {
+            path: self.path.clone(),
+            _lock: file,
+        }))
     }
 
-    fn lock_shared(&self) -> io::Result<Box<dyn Lock>> {
-        let lock_path = lock_file_path(&self.path);
-
-        let file = fs::File::create(&lock_path)?;
-        // TODO consider switching to std equivalents, they seem to exist now
+    fn begin_shared(&self) -> io::Result<BackendOperation<Shared>> {
+        let file = self.open_lock_file()?;
         fs2::FileExt::lock_shared(&file)?;
-
-        Ok(Box::new(file))
+        Ok(BackendOperation::new(LocalOperation {
+            path: self.path.clone(),
+            _lock: file,
+        }))
     }
+}
 
+impl OperationState for LocalOperation {
     fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
         Ok(Box::new(LocalThread {
             path: self.path.clone(),
-            rand_ext: std::str::from_utf8(
-                &rand::rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(20)
-                    .collect::<Vec<_>>()[..],
-            )
-            .expect("must always be utf8")
-            .to_string(),
+            rand_ext: rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(20)
+                .map(char::from)
+                .collect(),
         }))
     }
 }
 
 impl Local {
+    fn open_lock_file(&self) -> io::Result<fs::File> {
+        fs::create_dir_all(&self.path)?;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_file_path(&self.path))
+    }
+
     pub fn new(path: PathBuf) -> Self {
         Local { path }
     }
 }
 
 impl BackendThread for LocalThread {
+    fn promote_chunk(
+        &mut self,
+        promotion: super::promotion::ChunkPromotion,
+    ) -> io::Result<()> {
+        let source = self.path.join(promotion.source_path());
+        let destination = self.path.join(promotion.destination_path());
+        // Validated chunk paths have a generation and chunk directory, so the
+        // destination has a parent regardless of repository nesting depth.
+        let parent = destination.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk destination has no parent",
+            )
+        })?;
+        fs::create_dir_all(parent)?;
+        match fs::hard_link(&source, &destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::metadata(&destination)?.is_file() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunk destination is not a file",
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn remove_dir_all(&mut self, path: PathBuf) -> io::Result<()> {
         let path = self.path.join(path);
         fs::remove_dir_all(&path)
@@ -242,3 +285,153 @@ impl BackendThread for LocalThread {
 }
 
 // vim: foldmethod=marker foldmarker={{{,}}}
+
+#[cfg(test)]
+mod tests {
+    use super::{lock_file_path, Local};
+    use crate::backends::Backend;
+    use fs2::FileExt;
+    use std::fs::{self, File};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct RepositoryDirectory(PathBuf);
+
+    impl RepositoryDirectory {
+        fn new() -> Self {
+            // This counter distinguishes temporary resources, not test inputs.
+            static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "rdedup-operation-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn observer(&self) -> File {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_file_path(&self.0))
+                .unwrap()
+        }
+    }
+
+    impl Drop for RepositoryDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_shared_promotions_preserve_source_and_destination() {
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let source = PathBuf::from(format!(
+            "0000000000000000-0000000000000000/chunk/{}",
+            "ab".repeat(32)
+        ));
+        let destination = PathBuf::from(format!(
+            "0000000000000001-0000000000000000/chunk/{}",
+            "ab".repeat(32)
+        ));
+        let promotion = crate::backends::ChunkPromotion::from_paths(
+            source.clone(),
+            destination.clone(),
+        )
+        .unwrap();
+        let operation = backend.begin_shared().unwrap();
+        let mut first = operation.new_thread().unwrap();
+        first
+            .create(
+                source.clone(),
+                sgdata::SGData::from_single(b"stored chunk".to_vec()),
+            )
+            .unwrap();
+        let mut second = operation.new_thread().unwrap();
+        let other_promotion = promotion.clone();
+        std::thread::scope(|scope| {
+            let first_write =
+                scope.spawn(move || first.promote_chunk(promotion));
+            let second_write =
+                scope.spawn(move || second.promote_chunk(other_promotion));
+            first_write.join().unwrap().unwrap();
+            second_write.join().unwrap().unwrap();
+        });
+        assert_eq!(
+            fs::read(directory.0.join(&source)).unwrap(),
+            b"stored chunk"
+        );
+        assert_eq!(
+            fs::read(directory.0.join(&destination)).unwrap(),
+            b"stored chunk"
+        );
+        drop(operation);
+        let exclusive = backend.begin_exclusive().unwrap();
+        exclusive.new_thread().unwrap().remove(source).unwrap();
+        assert_eq!(
+            fs::read(directory.0.join(destination)).unwrap(),
+            b"stored chunk"
+        );
+    }
+
+    #[test]
+    fn shared_worker_keeps_exclusive_access_blocked_after_operation_drop() {
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let operation = backend.begin_shared().unwrap();
+        let mut worker = operation.new_thread().unwrap();
+        let observer = directory.observer();
+        drop(operation);
+        drop(backend);
+
+        assert!(observer.try_lock_exclusive().is_err());
+        worker.list(PathBuf::new()).unwrap();
+        drop(worker);
+        observer.try_lock_exclusive().unwrap();
+    }
+
+    #[test]
+    fn exclusive_worker_keeps_readers_blocked_after_operation_drop() {
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let operation = backend.begin_exclusive().unwrap();
+        let worker = operation.new_thread().unwrap();
+        let observer = directory.observer();
+        drop(operation);
+
+        assert!(FileExt::try_lock_shared(&observer).is_err());
+        drop(worker);
+        FileExt::try_lock_shared(&observer).unwrap();
+    }
+
+    #[test]
+    fn dropping_one_shared_operation_does_not_release_another() {
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let first = backend.begin_shared().unwrap();
+        let second = backend.begin_shared().unwrap();
+        let observer = directory.observer();
+
+        drop(first);
+        assert!(observer.try_lock_exclusive().is_err());
+        drop(second);
+        observer.try_lock_exclusive().unwrap();
+    }
+
+    #[test]
+    fn restricting_an_exclusive_operation_retains_exclusive_protection() {
+        let directory = RepositoryDirectory::new();
+        let backend = Local::new(directory.0.clone());
+        let exclusive = backend.begin_exclusive().unwrap();
+        let shared_capability = exclusive.shared();
+        let observer = directory.observer();
+        drop(exclusive);
+
+        assert!(FileExt::try_lock_shared(&observer).is_err());
+        drop(shared_capability);
+        FileExt::try_lock_shared(&observer).unwrap();
+    }
+}

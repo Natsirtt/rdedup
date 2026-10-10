@@ -20,20 +20,6 @@ use super::{Backend, BackendThread};
 use crate::aio;
 use crate::config;
 
-// TODO: make a thread, that keeps updating
-// a timestamp file on the backend
-pub struct Lock {
-    path: PathBuf,
-}
-
-impl Lock {
-    fn new(path: PathBuf) -> Self {
-        Lock { path }
-    }
-}
-
-impl aio::Lock for Lock {}
-
 #[derive(Debug)]
 pub struct B2 {
     cred: B2Credentials,
@@ -136,19 +122,24 @@ impl B2Thread {
 }
 
 impl Backend for B2 {
-    fn lock_exclusive(&self) -> io::Result<Box<dyn aio::Lock>> {
-        Ok(Box::new(Lock::new(PathBuf::from(config::LOCK_FILE))))
+    fn begin_exclusive(
+        &self,
+    ) -> io::Result<super::backend::BackendOperation<super::backend::Exclusive>>
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "B2 does not implement repository protection",
+        ))
     }
 
-    fn lock_shared(&self) -> io::Result<Box<dyn aio::Lock>> {
-        Ok(Box::new(Lock::new(PathBuf::from(config::LOCK_FILE))))
-    }
-
-    fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
-        Ok(Box::new(B2Thread::new_from_cred(
-            &self.cred,
-            self.bucket.clone(),
-        )?))
+    fn begin_shared(
+        &self,
+    ) -> io::Result<super::backend::BackendOperation<super::backend::Shared>>
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "B2 does not implement repository protection",
+        ))
     }
 }
 
@@ -167,6 +158,16 @@ impl B2 {
 }
 
 impl BackendThread for B2Thread {
+    fn promote_chunk(
+        &mut self,
+        _promotion: super::promotion::ChunkPromotion,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "backend does not support protected chunk promotion",
+        ))
+    }
+
     fn remove_dir_all(&mut self, path: PathBuf) -> io::Result<()> {
         fs::remove_dir_all(&path)
     }

@@ -37,7 +37,7 @@ impl Name {
     pub(crate) fn remove(
         name: &str,
         gen: Generation,
-        aio: &aio::AsyncIO,
+        aio: &aio::ExclusiveAsyncIO,
     ) -> io::Result<()> {
         let path = Name::path(name, gen);
         aio.remove(path).wait()
@@ -46,7 +46,7 @@ impl Name {
     pub(crate) fn remove_any(
         name: &str,
         gens: &[Generation],
-        aio: &aio::AsyncIO,
+        aio: &aio::ExclusiveAsyncIO,
     ) -> io::Result<()> {
         for gen in gens.iter().rev() {
             match Name::remove(name, *gen, aio) {
@@ -65,7 +65,7 @@ impl Name {
         name: &str,
         cur_generation: Generation,
         gens: &[Generation],
-        aio: &aio::AsyncIO,
+        aio: &aio::ExclusiveAsyncIO,
     ) -> io::Result<()> {
         let dst_path = Name::path(name, cur_generation);
         for gen in gens.iter().rev() {
@@ -210,19 +210,8 @@ impl Name {
             created,
         };
 
-        let is_serde_err = serde_yaml::to_string(&name)
-            .map(|serialized_str| {
-                aio.write(
-                    path,
-                    SGData::from_single(serialized_str.into_bytes()),
-                )
-                .wait()
-            })
-            .is_err();
-        // re-write the `Name` configuration to include the `created` field.
-        if is_serde_err {
-            // FIXME: log the write error?
-        }
+        // Reads derive missing timestamps in memory. Persisting the upgrade
+        // would require exclusive protection and is not part of a read.
         Ok(name)
     }
 

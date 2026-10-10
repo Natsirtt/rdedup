@@ -1,7 +1,6 @@
 use crate::iterators::StoredChunks;
 use crate::settings;
 use crate::util::{ReaderVecIter, WhileOk};
-use hex;
 use rand::{self, Rng};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -17,7 +16,7 @@ mod lib {
     pub use super::super::*;
 }
 
-const PASS: &'static str = "FOO";
+const PASS: &str = "FOO";
 const DIGEST_SIZE: usize = 32;
 
 fn rand_tmp_dir() -> PathBuf {
@@ -28,15 +27,16 @@ fn rand_tmp_dir() -> PathBuf {
                 .take(20)
                 .collect::<Vec<_>>()[..],
         )
-        .expect("must always be utf8")
-        .to_string(),
+        .expect("must always be utf8"),
     )
 }
 
 fn list_stored_chunks(repo: &lib::Repo) -> Result<HashSet<Vec<u8>>> {
+    let operation = repo.backend.begin_shared()?;
+    let aio = crate::aio::AsyncIO::new(operation, repo.log.clone())?;
     let mut digests = HashSet::new();
     let data_chunks = StoredChunks::new(
-        &repo.aio,
+        &aio,
         PathBuf::from("."),
         DIGEST_SIZE,
         repo.log.clone(),
@@ -140,7 +140,7 @@ fn wipe(repo: &lib::Repo) {
 
     for name in &names {
         println!("Wiping name: {}", name);
-        repo.rm(&name).unwrap();
+        repo.rm(name).unwrap();
     }
 
     println!("Final GC");
@@ -156,7 +156,7 @@ fn zero_size() {
     {
         let zero = Vec::new();
         let enc_handle = repo.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
-        repo.write("zero", &mut io::Cursor::new(zero), &enc_handle)
+        repo.write("zero", io::Cursor::new(zero), &enc_handle)
             .unwrap();
     }
 
@@ -182,13 +182,13 @@ fn byte_size() {
     for &b in &tests {
         let data = vec![b];
         let name = hex::encode(&data);
-        repo.write(&name, &mut io::Cursor::new(&data), &enc_handle)
+        repo.write(&name, io::Cursor::new(&data), &enc_handle)
             .unwrap();
     }
     for &b in &tests {
         let mut data = Vec::new();
         let name = hex::encode(vec![b]);
-        repo.read(&name, &mut data, &dec_handle).unwrap();
+        repo.read(name.as_str(), &mut data, &dec_handle).unwrap();
         assert_eq!(data, vec![b]);
     }
 
@@ -214,9 +214,9 @@ fn random_sanity() {
 
     repo.gc(0).unwrap();
 
-    for &(ref name, ref digest) in &names {
+    for (name, digest) in &names {
         let mut data = vec![];
-        repo.read(&name, &mut data, &dec_handle).unwrap();
+        repo.read(name.as_str(), &mut data, &dec_handle).unwrap();
 
         let mut sha = Sha256::default();
         sha.update(&data);
@@ -230,7 +230,7 @@ fn random_sanity() {
 
         {
             let mut data = vec![];
-            repo.read(&name, &mut data, &dec_handle).unwrap();
+            repo.read(name.as_str(), &mut data, &dec_handle).unwrap();
 
             let mut sha = Sha256::default();
             sha.update(&data);
@@ -242,7 +242,7 @@ fn random_sanity() {
         let reachable = repo.list_reachable_chunks().unwrap();
         let stored = list_stored_chunks(&repo).unwrap();
 
-        assert_eq!(reachable.iter().count(), stored.iter().count());
+        assert_eq!(reachable.len(), stored.len());
 
         for digest in reachable.iter() {
             assert!(stored.contains(digest));
@@ -282,7 +282,7 @@ fn change_passphrase() {
         let enc_handle =
             repo.unlock_encrypt(&|| Ok(prev_passphrase.into())).unwrap();
 
-        repo.write("data", &mut io::Cursor::new(&data_before), &enc_handle)
+        repo.write("data", io::Cursor::new(&data_before), &enc_handle)
             .unwrap();
     }
 
@@ -330,7 +330,7 @@ fn verify_name() {
     let enc_handle = repo.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
     let data = rand_data(1024);
     {
-        repo.write("data", &mut io::Cursor::new(&data), &enc_handle)
+        repo.write("data", io::Cursor::new(&data), &enc_handle)
             .unwrap();
     }
 
@@ -338,7 +338,12 @@ fn verify_name() {
     assert_eq!(result.errors.len(), 0);
 
     // Corrupt first chunk we find
-    let generations = repo.read_generations().unwrap();
+    let generations = {
+        let operation = repo.backend.begin_shared().unwrap();
+        let aio =
+            crate::aio::AsyncIO::new(operation, repo.log.clone()).unwrap();
+        repo.read_generations(&aio).unwrap()
+    };
 
     let chunk_path = dir.join(generations[0].to_string()).join("chunk");
     for l1 in fs::read_dir(&chunk_path).unwrap() {
@@ -350,11 +355,10 @@ fn verify_name() {
                     for l3 in fs::read_dir(l2.path()).unwrap() {
                         let l3 = l3.unwrap();
                         let mut chunk = OpenOptions::new()
-                            .write(true)
                             .append(true)
                             .open(l3.path())
                             .unwrap();
-                        chunk.write(&vec![1]).unwrap();
+                        chunk.write_all(&[1]).unwrap();
                     }
                 }
             }
@@ -374,20 +378,17 @@ fn test_stored_chunks_iter() {
 
     let enc_handle = repo.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
 
-    repo.write("data", &mut io::Cursor::new(&data), &enc_handle)
+    repo.write("data", io::Cursor::new(&data), &enc_handle)
         .unwrap();
     let chunks_from_indexes = repo.list_reachable_chunks().unwrap();
 
     let mut chunks_from_iter = list_stored_chunks(&repo).unwrap();
-    assert_eq!(
-        chunks_from_indexes.iter().count(),
-        chunks_from_iter.iter().count()
-    );
+    assert_eq!(chunks_from_indexes.len(), chunks_from_iter.len());
     assert_eq!(chunks_from_indexes.difference(&chunks_from_iter).count(), 0);
 
     // Add a second name to the repo and compare chunks
     let data2 = rand_data(1024 * 1024);
-    repo.write("data2", &mut io::Cursor::new(&data2), &enc_handle)
+    repo.write("data2", io::Cursor::new(&data2), &enc_handle)
         .unwrap();
     let chunks_from_indexes2 = repo.list_reachable_chunks().unwrap();
     chunks_from_iter = list_stored_chunks(&repo).unwrap();
@@ -425,7 +426,7 @@ fn test_custom_chunking_size() {
 
             let result = settings.use_bup_chunking(Some(bits));
 
-            if bits < 10 || bits > 30 {
+            if !(10..=30).contains(&bits) {
                 if result.is_err() {
                     continue;
                 } else {
@@ -495,7 +496,7 @@ fn test_custom_nesting() {
             let enc_handle = repo.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
             let dec_handle = repo.unlock_decrypt(&|| Ok(PASS.into())).unwrap();
 
-            repo.write("data", &mut io::Cursor::new(&data), &enc_handle)
+            repo.write("data", io::Cursor::new(&data), &enc_handle)
                 .unwrap();
 
             let mut load_data = vec![];
@@ -525,9 +526,7 @@ fn test_readerveciter() {
 
     let r2vi = ReaderVecIter::new(input.as_slice(), 2);
     let r2vi_e = r2vi.map(|x| match x {
-        Ok(ref v) if *v == vec![2, 3] => {
-            Err(io::Error::new(io::ErrorKind::Other, "error"))
-        }
+        Ok(ref v) if *v == vec![2, 3] => Err(io::Error::other("error")),
         x => x,
     });
     let mut while_ok = WhileOk::new(r2vi_e);
@@ -538,41 +537,34 @@ fn test_readerveciter() {
     assert!(while_ok.finish().is_some());
 }
 
-struct FailingLockBackend {
-    repository_path: PathBuf,
-}
+struct FailingLockBackend;
 
 impl lib::backends::Backend for FailingLockBackend {
-    fn lock_exclusive(&self) -> io::Result<Box<dyn lib::backends::Lock>> {
+    fn begin_exclusive(
+        &self,
+    ) -> io::Result<lib::backends::BackendOperation<lib::backends::Exclusive>>
+    {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "lock denied",
         ))
     }
 
-    fn lock_shared(&self) -> io::Result<Box<dyn lib::backends::Lock>> {
+    fn begin_shared(
+        &self,
+    ) -> io::Result<lib::backends::BackendOperation<lib::backends::Shared>>
+    {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "lock denied",
         ))
-    }
-
-    fn new_thread(&self) -> io::Result<Box<dyn lib::backends::BackendThread>> {
-        lib::backends::local::Local::new(self.repository_path.clone())
-            .new_thread()
     }
 }
 
 fn repo_with_failing_locks() -> lib::Repo {
-    let repository_path = rand_tmp_dir();
-    let backend = Arc::new(move || {
-        Ok(Box::new(FailingLockBackend {
-            repository_path: repository_path.clone(),
-        }) as Box<dyn lib::backends::Backend + Send + Sync>)
-    });
-    let mut settings = settings::Repo::new();
-    settings.set_pwhash(settings::PWHash::Weak);
-    lib::Repo::init(backend, &|| Ok(PASS.into()), settings, None).unwrap()
+    let mut repository = test_repo(PASS);
+    repository.backend = Arc::new(FailingLockBackend);
+    repository
 }
 
 #[test]
@@ -604,10 +596,10 @@ fn retrying_a_name_write_with_the_same_contents_succeeds() {
     let data = b"retry-safe archive contents";
 
     repository
-        .write("archive", &mut io::Cursor::new(data), &encryption)
+        .write("archive", io::Cursor::new(data), &encryption)
         .unwrap();
     repository
-        .write("archive", &mut io::Cursor::new(data), &encryption)
+        .write("archive", io::Cursor::new(data), &encryption)
         .expect("retrying the same name and contents should succeed");
 
     let mut stored_data = Vec::new();
@@ -627,12 +619,12 @@ fn conflicting_name_write_preserves_the_original_contents() {
     let original_data = b"original archive contents";
 
     repository
-        .write("archive", &mut io::Cursor::new(original_data), &encryption)
+        .write("archive", io::Cursor::new(original_data), &encryption)
         .unwrap();
     let error = repository
         .write(
             "archive",
-            &mut io::Cursor::new(b"different archive contents"),
+            io::Cursor::new(b"different archive contents"),
             &encryption,
         )
         .unwrap_err();
@@ -646,4 +638,113 @@ fn conflicting_name_write_preserves_the_original_contents() {
     assert_eq!(stored_data, original_data);
 
     wipe(&repository);
+}
+
+#[test]
+fn reading_a_legacy_name_does_not_rewrite_it() {
+    let (repository, directory) = test_repo_dir(PASS);
+    let encryption = repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+    let decryption = repository.unlock_decrypt(&|| Ok(PASS.into())).unwrap();
+    repository
+        .write("legacy", io::Cursor::new(b"archive bytes"), &encryption)
+        .unwrap();
+    let operation = repository.backend.begin_shared().unwrap();
+    let aio =
+        crate::aio::AsyncIO::new(operation, repository.log.clone()).unwrap();
+    let generations = repository.read_generations(&aio).unwrap();
+    let path = directory.join(crate::name::Name::path(
+        "legacy",
+        *generations.last().unwrap(),
+    ));
+    drop(aio);
+    let mut name: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(&path).unwrap()).unwrap();
+    name.as_mapping_mut()
+        .unwrap()
+        .remove(serde_yaml::Value::String("created".into()));
+    let legacy = serde_yaml::to_string(&name).unwrap();
+    fs::write(&path, &legacy).unwrap();
+    let mut contents = Vec::new();
+    repository
+        .read("legacy", &mut contents, &decryption)
+        .unwrap();
+    assert_eq!(contents, b"archive bytes");
+    assert_eq!(fs::read_to_string(&path).unwrap(), legacy);
+    wipe(&repository);
+}
+
+#[test]
+fn a_repository_reuses_its_backend_across_operations_and_clones() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = rand_tmp_dir();
+    let selections = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&selections);
+    let selected_directory = directory.clone();
+    let select: Arc<lib::BackendSelectFn> = Arc::new(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(lib::backends::local::Local::new(
+            selected_directory.clone(),
+        )))
+    });
+    let mut settings = settings::Repo::new();
+    settings.set_pwhash(settings::PWHash::Weak);
+    let repository =
+        lib::Repo::init(select, &|| Ok(PASS.into()), settings, None).unwrap();
+    repository.list_names().unwrap();
+    repository.clone().list_names().unwrap();
+    assert_eq!(selections.load(Ordering::SeqCst), 1);
+    drop(repository);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn cache_population_uses_shared_protection_and_preserves_storage_errors() {
+    use lib::backends::{local::Local, local_cache::LocalCache, Backend};
+    use sgdata::SGData;
+    let cache_directory = rand_tmp_dir();
+    let remote_directory = rand_tmp_dir();
+    let remote = Local::new(remote_directory.clone());
+    let operation = remote.begin_shared().unwrap();
+    let mut worker = operation.new_thread().unwrap();
+    worker
+        .create(
+            "object".into(),
+            SGData::from_single(b"stored bytes".to_vec()),
+        )
+        .unwrap();
+    worker
+        .create(
+            "broken".into(),
+            SGData::from_single(b"remote fallback".to_vec()),
+        )
+        .unwrap();
+    drop(worker);
+    drop(operation);
+    let cache = LocalCache::new(cache_directory.clone(), Box::new(remote));
+    let operation = cache.begin_shared().unwrap();
+    let observer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(cache_directory.join(".lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_shared(&observer).unwrap();
+    fs2::FileExt::unlock(&observer).unwrap();
+    assert!(fs2::FileExt::try_lock_exclusive(&observer).is_err());
+    let mut worker = operation.new_thread().unwrap();
+    assert_eq!(
+        worker.read("object".into()).unwrap().into_linear_vec(),
+        b"stored bytes"
+    );
+    assert_eq!(
+        fs::read(cache_directory.join("object")).unwrap(),
+        b"stored bytes"
+    );
+    fs::create_dir(cache_directory.join("broken")).unwrap();
+    assert!(worker.read("broken".into()).is_err());
+    drop(worker);
+    drop(operation);
+    drop(observer);
+    drop(cache);
+    fs::remove_dir_all(cache_directory).unwrap();
+    fs::remove_dir_all(remote_directory).unwrap();
 }

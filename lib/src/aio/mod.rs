@@ -28,6 +28,8 @@ pub(crate) mod b2;
 pub(crate) use self::b2::B2;
 
 pub(crate) mod backend;
+pub(crate) mod promotion;
+use promotion::ChunkPromotion;
 pub(crate) mod local_cache;
 
 use self::backend::*;
@@ -60,7 +62,12 @@ pub struct AsyncIOResult<T> {
 impl<T> AsyncIOResult<T> {
     /// Block until result arrives
     pub fn wait(self) -> io::Result<T> {
-        self.rx.recv().expect("No `AsyncIO` thread response")
+        self.rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "I/O worker ended without a result",
+            )
+        })?
     }
 }
 
@@ -76,6 +83,7 @@ pub struct WriteStats {
 ///
 /// Each type of job
 enum Message {
+    PromoteChunk(ChunkPromotion, mpsc::Sender<io::Result<()>>),
     Write(WriteArgs),
     Read(PathBuf, mpsc::Sender<io::Result<SGData>>),
     ReadMetadata(PathBuf, mpsc::Sender<io::Result<Metadata>>),
@@ -101,8 +109,18 @@ pub struct AsyncIO {
 }
 
 impl AsyncIO {
+    pub(crate) fn promote_chunk(
+        &self,
+        promotion: ChunkPromotion,
+    ) -> AsyncIOResult<()> {
+        let (sender, receiver) = mpsc::channel();
+        // Disconnection drops the reply sender; wait reports BrokenPipe.
+        let _ = self.tx.send(Message::PromoteChunk(promotion, sender));
+        AsyncIOResult { rx: receiver }
+    }
+
     pub(crate) fn new(
-        backend: Box<dyn Backend + Send + Sync>,
+        operation: BackendOperation<Shared>,
         log: Logger,
     ) -> io::Result<Self> {
         let thread_num = 4 * num_cpus::get();
@@ -110,47 +128,42 @@ impl AsyncIO {
 
         let shared = AsyncIOThreadShared::new();
 
-        let mut spawn_res: Vec<io::Result<_>> = (0..thread_num)
+        // Prepare every worker before spawning; a construction failure drops
+        // the entire operation synchronously without detached worker threads.
+        let workers = (0..thread_num)
             .map(|_| {
-                let rx = rx.clone();
-                let shared = shared.clone();
-                let log = log.clone();
-                let backend = backend.new_thread()?;
-                Ok(thread::spawn(move || {
-                    let mut thread =
-                        AsyncIOThread::new(shared, rx, backend, log);
-                    thread.run();
-                }))
+                operation
+                    .new_thread()
+                    .map(|worker| worker.into_protected_thread())
             })
-            .collect();
-
-        drop(rx);
-
-        let mut join = vec![];
-
-        for r in spawn_res.drain(..) {
-            join.push(r?);
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut join = Vec::with_capacity(thread_num);
+        for backend in workers {
+            let receiver = rx.clone();
+            let worker_shared = shared.clone();
+            let worker_log = log.clone();
+            join.push(thread::spawn(move || {
+                let mut worker = AsyncIOThread::new(
+                    worker_shared,
+                    receiver,
+                    backend,
+                    worker_log,
+                );
+                worker.run();
+            }));
         }
+        drop(rx);
 
         let shared = AsyncIOShared {
             join,
             log: log.clone(),
             stats: shared,
-            backend,
         };
 
         Ok(AsyncIO {
             shared: Arc::new(shared),
             tx: AutoOption::new(tx),
         })
-    }
-
-    pub(crate) fn lock_exclusive(&self) -> io::Result<Box<dyn Lock>> {
-        self.shared.backend.lock_exclusive()
-    }
-
-    pub(crate) fn lock_shared(&self) -> io::Result<Box<dyn Lock>> {
-        self.shared.backend.lock_shared()
     }
 
     pub fn stats(&self) -> AsyncIOThreadShared {
@@ -185,19 +198,6 @@ impl AsyncIO {
         Box::new(iter)
     }
 
-    pub fn write(&self, path: PathBuf, sg: SGData) -> AsyncIOResult<()> {
-        let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Message::Write(WriteArgs {
-                path,
-                data: sg,
-                idempotent: false,
-                complete_tx: Some(tx),
-            }))
-            .expect("aio tx closed: write");
-        AsyncIOResult { rx }
-    }
-
     // TODO: No need for it anymore
     #[allow(dead_code)]
     pub fn write_idempotent(
@@ -215,21 +215,6 @@ impl AsyncIO {
             }))
             .expect("aio tx closed: write_idempotent");
         AsyncIOResult { rx }
-    }
-
-    /// Will panic the worker thread if fails, but does not require
-    /// managing the result
-    // TODO: No need for it anymore
-    #[allow(dead_code)]
-    pub fn write_checked(&self, path: PathBuf, sg: SGData) {
-        self.tx
-            .send(Message::Write(WriteArgs {
-                path,
-                data: sg,
-                idempotent: false,
-                complete_tx: None,
-            }))
-            .expect("aio tx closed: write_checked");
     }
 
     pub fn write_checked_idempotent(&self, path: PathBuf, sg: SGData) {
@@ -261,10 +246,45 @@ impl AsyncIO {
             .expect("aio tx closed: read_metadata");
         AsyncIOResult { rx }
     }
+}
+
+/// Destructive I/O capability retaining exclusive repository protection.
+pub(crate) struct ExclusiveAsyncIO {
+    shared: AsyncIO,
+}
+
+impl ExclusiveAsyncIO {
+    pub(crate) fn new(
+        operation: BackendOperation<Exclusive>,
+        log: Logger,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            shared: AsyncIO::new(operation.shared(), log)?,
+        })
+    }
+
+    pub(crate) fn shared(&self) -> &AsyncIO {
+        &self.shared
+    }
+
+    pub fn replace(&self, path: PathBuf, sg: SGData) -> AsyncIOResult<()> {
+        let (tx, rx) = mpsc::channel();
+        self.shared
+            .tx
+            .send(Message::Write(WriteArgs {
+                path,
+                data: sg,
+                idempotent: false,
+                complete_tx: Some(tx),
+            }))
+            .expect("aio tx closed: replace");
+        AsyncIOResult { rx }
+    }
 
     pub fn remove(&self, path: PathBuf) -> AsyncIOResult<()> {
         let (tx, rx) = mpsc::channel();
-        self.tx
+        self.shared
+            .tx
             .send(Message::Remove(path, tx))
             .expect("aio tx closed: remove");
         AsyncIOResult { rx }
@@ -272,7 +292,8 @@ impl AsyncIO {
 
     pub fn remove_dir_all(&self, path: PathBuf) -> AsyncIOResult<()> {
         let (tx, rx) = mpsc::channel();
-        self.tx
+        self.shared
+            .tx
             .send(Message::RemoveDirAll(path, tx))
             .expect("aio tx closed: remove_dir_all");
         AsyncIOResult { rx }
@@ -280,7 +301,8 @@ impl AsyncIO {
 
     pub fn rename(&self, src: PathBuf, dst: PathBuf) -> AsyncIOResult<()> {
         let (tx, rx) = mpsc::channel();
-        self.tx
+        self.shared
+            .tx
             .send(Message::Rename(src, dst, tx))
             .expect("aio tx closed: rename");
         AsyncIOResult { rx }
@@ -305,7 +327,6 @@ pub struct AsyncIOShared {
     join: Vec<thread::JoinHandle<()>>,
     log: slog::Logger,
     stats: AsyncIOThreadShared,
-    backend: Box<dyn Backend + Send + Sync>,
 }
 
 impl Drop for AsyncIOShared {
@@ -365,7 +386,7 @@ struct AsyncIOThread {
     rx: crossbeam_channel::Receiver<Message>,
     log: Logger,
     time_reporter: TimeReporter,
-    backend: RefCell<Box<dyn BackendThread>>,
+    backend: RefCell<ProtectedThread>,
 }
 
 /// Guard that removes entry from the pending paths on drop
@@ -382,7 +403,7 @@ impl AsyncIOThread {
     fn new(
         shared: AsyncIOThreadShared,
         rx: crossbeam_channel::Receiver<Message>,
-        backend: Box<dyn BackendThread>,
+        backend: ProtectedThread,
         log: Logger,
     ) -> Self {
         let t = TimeReporter::new_with_level(
@@ -405,6 +426,15 @@ impl AsyncIOThread {
 
             if let Ok(msg) = self.rx.recv() {
                 match msg {
+                    Message::PromoteChunk(promotion, sender) => {
+                        let result = self
+                            .backend
+                            .borrow_mut()
+                            .thread
+                            .promote_chunk(promotion);
+                        let _ = sender.send(result);
+                    }
+
                     Message::Write(WriteArgs {
                         path,
                         data,
@@ -456,10 +486,11 @@ impl AsyncIOThread {
         }
 
         let len = sg.len();
-        let res = self
-            .backend
-            .borrow_mut()
-            .write(path.clone(), sg, idempotent);
+        let res = self.backend.borrow_mut().thread.write(
+            path.clone(),
+            sg,
+            idempotent,
+        );
         {
             let mut sh = self.shared.inner.lock().unwrap();
             sh.in_progress.remove(&path);
@@ -516,7 +547,7 @@ impl AsyncIOThread {
         self.time_reporter.start("read");
         let res = {
             let _guard = self.pending_wait_and_insert(&path);
-            self.backend.borrow_mut().read(path.clone())
+            self.backend.borrow_mut().thread.read(path.clone())
         };
         self.time_reporter.start("read send response");
         tx.send(res).expect("send failed")
@@ -532,7 +563,7 @@ impl AsyncIOThread {
         self.time_reporter.start("read-metadata");
         let res = {
             let _guard = self.pending_wait_and_insert(&path);
-            self.backend.borrow_mut().read_metadata(path.clone())
+            self.backend.borrow_mut().thread.read_metadata(path.clone())
         };
 
         self.time_reporter.start("read send response");
@@ -547,7 +578,7 @@ impl AsyncIOThread {
         trace!(self.log, "list"; "path" => %path.display());
 
         self.time_reporter.start("list");
-        let res = self.backend.borrow_mut().list(path);
+        let res = self.backend.borrow_mut().thread.list(path);
         self.time_reporter.start("list send response");
         tx.send(res).expect("send failed")
     }
@@ -560,7 +591,7 @@ impl AsyncIOThread {
         trace!(self.log, "list"; "path" => %path.display());
         self.time_reporter.start("list");
 
-        self.backend.borrow_mut().list_recursively(path, tx)
+        self.backend.borrow_mut().thread.list_recursively(path, tx)
     }
 
     fn remove(&mut self, path: PathBuf, tx: mpsc::Sender<io::Result<()>>) {
@@ -569,7 +600,7 @@ impl AsyncIOThread {
         self.time_reporter.start("remove");
         let res = {
             let _guard = self.pending_wait_and_insert(&path);
-            self.backend.borrow_mut().remove(path.clone())
+            self.backend.borrow_mut().thread.remove(path.clone())
         };
         self.time_reporter.start("remove send response");
         tx.send(res).expect("send failed")
@@ -583,7 +614,7 @@ impl AsyncIOThread {
         trace!(self.log, "remove-dir-all"; "path" => %path.display());
 
         self.time_reporter.start("remove-dir-all");
-        let res = self.backend.borrow_mut().remove_dir_all(path);
+        let res = self.backend.borrow_mut().thread.remove_dir_all(path);
 
         self.time_reporter.start("remove send response");
         tx.send(res).expect("send failed")
@@ -608,6 +639,7 @@ impl AsyncIOThread {
             let _guard = self.pending_wait_and_insert(&dst_path);
             self.backend
                 .borrow_mut()
+                .thread
                 .rename(src_path.clone(), dst_path.clone())
         };
         self.time_reporter.start("remove send response");

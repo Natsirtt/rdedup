@@ -238,6 +238,7 @@ pub(crate) trait ChunkAccessor {
 /// anything
 pub(crate) struct DefaultChunkAccessor<'a> {
     repo: &'a Repo,
+    aio: &'a crate::aio::AsyncIO,
     decrypter: Option<ArcDecrypter>,
     compression: ArcCompression,
     gen_strings: Vec<String>,
@@ -246,12 +247,14 @@ pub(crate) struct DefaultChunkAccessor<'a> {
 impl<'a> DefaultChunkAccessor<'a> {
     pub(crate) fn new(
         repo: &'a Repo,
+        aio: &'a crate::aio::AsyncIO,
         decrypter: Option<ArcDecrypter>,
         compression: ArcCompression,
         generations: Vec<Generation>,
     ) -> Self {
         DefaultChunkAccessor {
             repo,
+            aio,
             decrypter,
             compression,
             gen_strings: generations.iter().map(|g| g.to_string()).collect(),
@@ -272,7 +275,7 @@ impl ChunkAccessor for DefaultChunkAccessor<'_> {
 
         for gen_str in self.gen_strings.iter().rev() {
             let path = self.repo.chunk_rel_path_by_digest(digest, gen_str);
-            match self.repo.aio.read(path).wait() {
+            match self.aio.read(path).wait() {
                 Ok(d) => {
                     data = Some(d);
                     data_gen_str = Some(gen_str);
@@ -297,14 +300,18 @@ impl ChunkAccessor for DefaultChunkAccessor<'_> {
             let cur_gen_path =
                 self.repo.chunk_rel_path_by_digest(digest, cur_gen_str);
 
-            // `rename` is best effort
-            //
-            // Should we fail if we're GCing, and we want to make sure
-            // everything reachable has been moved? Well, if it wa
+            // Promotion retains the old entry for concurrent shared readers.
             let res = self
-                .repo
                 .aio
-                .rename(data_gen_path.clone(), cur_gen_path.clone())
+                .promote_chunk(
+                    crate::backends::ChunkPromotion::from_paths(
+                        data_gen_path.clone(),
+                        cur_gen_path.clone(),
+                    )
+                    .map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidInput, error)
+                    })?,
+                )
                 .wait();
             if let Err(e) = res {
                 if e.kind() != io::ErrorKind::NotFound {
@@ -369,6 +376,7 @@ pub(crate) struct RecordingChunkAccessor<'a> {
 impl<'a> RecordingChunkAccessor<'a> {
     pub(crate) fn new(
         repo: &'a Repo,
+        aio: &'a crate::aio::AsyncIO,
         accessed: &'a mut HashSet<Vec<u8>>,
         decrypter: Option<ArcDecrypter>,
         compression: ArcCompression,
@@ -377,6 +385,7 @@ impl<'a> RecordingChunkAccessor<'a> {
         RecordingChunkAccessor {
             raw: DefaultChunkAccessor::new(
                 repo,
+                aio,
                 decrypter,
                 compression,
                 generations,
@@ -416,6 +425,7 @@ pub(crate) struct VerifyingChunkAccessor<'a> {
 impl<'a> VerifyingChunkAccessor<'a> {
     pub(crate) fn new(
         repo: &'a Repo,
+        aio: &'a crate::aio::AsyncIO,
         decrypter: Option<ArcDecrypter>,
         compression: ArcCompression,
         generations: Vec<Generation>,
@@ -423,6 +433,7 @@ impl<'a> VerifyingChunkAccessor<'a> {
         VerifyingChunkAccessor {
             raw: DefaultChunkAccessor::new(
                 repo,
+                aio,
                 decrypter,
                 compression,
                 generations,
@@ -478,12 +489,14 @@ pub(crate) struct GenerationUpdateChunkAccessor<'a> {
 impl<'a> GenerationUpdateChunkAccessor<'a> {
     pub(crate) fn new(
         repo: &'a Repo,
+        aio: &'a crate::aio::AsyncIO,
         compression: ArcCompression,
         generations: Vec<Generation>,
     ) -> Self {
         GenerationUpdateChunkAccessor {
             raw: DefaultChunkAccessor::new(
                 repo,
+                aio,
                 None,
                 compression,
                 generations,
@@ -508,7 +521,7 @@ impl ChunkAccessor for GenerationUpdateChunkAccessor<'_> {
 
         for gen_str in self.raw.gen_strings.iter().rev() {
             let path = self.raw.repo.chunk_rel_path_by_digest(digest, gen_str);
-            match self.raw.repo.aio.read_metadata(path).wait() {
+            match self.raw.aio.read_metadata(path).wait() {
                 Ok(_metadata) => {
                     data_gen_str = Some(gen_str);
                     break;
@@ -532,12 +545,19 @@ impl ChunkAccessor for GenerationUpdateChunkAccessor<'_> {
             let cur_gen_path =
                 self.raw.repo.chunk_rel_path_by_digest(digest, cur_gen_str);
 
-            // `rename` is best effort
+            // Promotion retains the old entry until exclusive GC reclaims it.
             let res = self
                 .raw
-                .repo
                 .aio
-                .rename(data_gen_path.clone(), cur_gen_path.clone())
+                .promote_chunk(
+                    crate::backends::ChunkPromotion::from_paths(
+                        data_gen_path.clone(),
+                        cur_gen_path.clone(),
+                    )
+                    .map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidInput, error)
+                    })?,
+                )
                 .wait();
             if let Err(e) = res {
                 if e.kind() != io::ErrorKind::NotFound {

@@ -1,5 +1,7 @@
 use crate::aio::Metadata;
-use crate::backends::{Backend, BackendThread, Lock};
+use crate::backends::{
+    Backend, BackendOperation, BackendThread, Exclusive, Shared,
+};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use sgdata::SGData;
@@ -7,17 +9,6 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::{io, mem};
 use url::Url;
-
-// TODO: This is meant to be a "read-only" http backend that can get data from a remote repository,
-// ideally served very efficiently with a static web server (for instance, rust's static-web-server
-// crate/binary).
-// Therefore a mechanism to implement a file lock is not really possible in such an architecture...
-// For now we ignore it because in practice only GC and rm operations need an exclusive lock (which
-// waits for all exclusive locks to have expired); so we can get quite far running like this as long as
-// we are careful. Eventually I would like to find a solution of sorts.
-struct NoLock {}
-
-impl Lock for NoLock {}
 
 #[derive(Deserialize)]
 struct FileInfo {
@@ -28,17 +19,11 @@ struct FileInfo {
     file_type: String,
 }
 
-pub struct HttpReadOnly {
-    base_url: Url,
-    client: Client,
-}
+pub struct HttpReadOnly;
 
 impl HttpReadOnly {
-    pub fn new(base_url: Url) -> Self {
-        HttpReadOnly {
-            base_url,
-            client: Client::new(),
-        }
+    pub fn new(_base_url: Url) -> Self {
+        HttpReadOnly
     }
 }
 
@@ -48,10 +33,6 @@ pub struct HttpReadOnlyThread {
 }
 
 impl HttpReadOnlyThread {
-    pub fn new(base_url: Url, client: Client) -> Self {
-        HttpReadOnlyThread { base_url, client }
-    }
-
     fn get_endpoint(&self, path: PathBuf) -> Result<Url, io::Error> {
         self.base_url.join(path.to_str().unwrap()).map_err(|e| {
             io::Error::new(
@@ -78,22 +59,15 @@ impl HttpReadOnlyThread {
 }
 
 impl Backend for HttpReadOnly {
-    fn lock_exclusive(&self) -> io::Result<Box<dyn Lock>> {
+    fn begin_exclusive(&self) -> io::Result<BackendOperation<Exclusive>> {
         Err(io::Error::new(
-            io::ErrorKind::ReadOnlyFilesystem,
-            "Static HTTP endpoint is read-only",
+            io::ErrorKind::Unsupported,
+            "static HTTP servers cannot provide repository protection",
         ))
     }
 
-    fn lock_shared(&self) -> io::Result<Box<dyn Lock>> {
-        Ok(Box::new(NoLock {}))
-    }
-
-    fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
-        Ok(Box::new(HttpReadOnlyThread::new(
-            self.base_url.clone(),
-            self.client.clone(),
-        )))
+    fn begin_shared(&self) -> io::Result<BackendOperation<Shared>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "static HTTP servers cannot provide repository protection; use a lease-aware rdedup server"))
     }
 }
 
@@ -118,6 +92,16 @@ fn is_directory_content_type(header: &reqwest::header::HeaderValue) -> bool {
 }
 
 impl BackendThread for HttpReadOnlyThread {
+    fn promote_chunk(
+        &mut self,
+        _promotion: super::promotion::ChunkPromotion,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "backend does not support protected chunk promotion",
+        ))
+    }
+
     fn remove_dir_all(&mut self, _path: PathBuf) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::ReadOnlyFilesystem,

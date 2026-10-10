@@ -1,4 +1,5 @@
 //! Credential names identify authenticated principals without retaining secrets.
+use serde::Deserialize;
 use std::str::FromStr;
 
 /// A credential name cannot be empty or contain control characters.
@@ -10,7 +11,8 @@ pub enum Error {
 }
 
 /// Human-readable identity configured for one bearer credential.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(try_from = "String")]
 pub struct CredentialName(String);
 
 impl CredentialName {
@@ -33,5 +35,12 @@ impl FromStr for CredentialName {
             return Err(Error::InvalidName);
         }
         Ok(Self(name.to_owned()))
+    }
+}
+
+impl TryFrom<String> for CredentialName {
+    type Error = Error;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        name.parse()
     }
 }

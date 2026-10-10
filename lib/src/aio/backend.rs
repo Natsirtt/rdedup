@@ -183,7 +183,11 @@ impl BackendWorker<Exclusive> {
     ///
     /// # Errors
     /// Returns a storage or protection failure.
-    pub fn write(&mut self, path: PathBuf, contents: SGData) -> io::Result<()> {
+    pub fn replace(
+        &mut self,
+        path: PathBuf,
+        contents: SGData,
+    ) -> io::Result<()> {
         self.thread.write(path, contents, false)
     }
 

@@ -1,16 +1,16 @@
 //! Additive publication of an existing chunk in a later generation.
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::{Generation, DIGEST_SIZE};
+use crate::chunk_path::ChunkPath;
 
 /// A rejected promotion request.
 #[derive(Debug, Error)]
 pub enum Error {
     /// A path does not identify a repository chunk.
-    #[error("invalid chunk path: {path}")]
-    InvalidPath { path: PathBuf },
+    #[error("invalid chunk path")]
+    InvalidPath(#[source] crate::chunk_path::Error),
     /// The paths identify different chunks or nesting layouts.
     #[error("promotion must preserve the chunk digest and nesting")]
     DifferentChunk,
@@ -26,8 +26,8 @@ pub enum Error {
 /// removes the older entry when reclaiming that generation.
 #[derive(Clone, Debug)]
 pub struct ChunkPromotion {
-    source: PathBuf,
-    destination: PathBuf,
+    source: ChunkPath,
+    destination: ChunkPath,
 }
 
 impl ChunkPromotion {
@@ -36,17 +36,28 @@ impl ChunkPromotion {
     /// # Errors
     /// Rejects malformed paths, different digests/nesting, and a destination
     /// which is not newer than the source.
-    pub fn new(source: PathBuf, destination: PathBuf) -> Result<Self, Error> {
-        let source_generation = generation(&source)?;
-        let destination_generation = generation(&destination)?;
-        if source
-            .components()
-            .skip(1)
-            .ne(destination.components().skip(1))
-        {
+    pub fn from_paths(
+        source: PathBuf,
+        destination: PathBuf,
+    ) -> Result<Self, Error> {
+        let source = ChunkPath::new(source).map_err(Error::InvalidPath)?;
+        let destination =
+            ChunkPath::new(destination).map_err(Error::InvalidPath)?;
+        Self::new(source, destination)
+    }
+
+    /// Promote one validated chunk location into a later generation.
+    ///
+    /// # Errors
+    /// Rejects different chunk identities/layouts or a non-forward generation.
+    pub fn new(
+        source: ChunkPath,
+        destination: ChunkPath,
+    ) -> Result<Self, Error> {
+        if !source.has_same_chunk_layout(&destination) {
             return Err(Error::DifferentChunk);
         }
-        if source_generation >= destination_generation {
+        if !source.is_before(&destination) {
             return Err(Error::NotForward);
         }
         Ok(Self {
@@ -57,43 +68,13 @@ impl ChunkPromotion {
 
     /// Repository-relative location of the already stored chunk.
     pub fn source_path(&self) -> &Path {
-        &self.source
+        self.source.as_path()
     }
 
     /// Repository-relative location to populate without replacing existing data.
     pub fn destination_path(&self) -> &Path {
-        &self.destination
+        self.destination.as_path()
     }
-}
-
-fn generation(path: &Path) -> Result<Generation, Error> {
-    let invalid = || Error::InvalidPath {
-        path: path.to_path_buf(),
-    };
-    let parts = path
-        .components()
-        .map(|component| match component {
-            Component::Normal(part) => part.to_str().ok_or_else(invalid),
-            _ => Err(invalid()),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if parts.len() < 3 || parts.len() > DIGEST_SIZE + 2 || parts[1] != "chunk" {
-        return Err(invalid());
-    }
-    let digest = parts[parts.len() - 1];
-    if digest.len() != DIGEST_SIZE * 2
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(invalid());
-    }
-    for (level, directory) in parts[2..parts.len() - 1].iter().enumerate() {
-        if *directory != &digest[level * 2..level * 2 + 2] {
-            return Err(invalid());
-        }
-    }
-    Generation::try_from(parts[0]).map_err(|_| invalid())
 }
 
 #[cfg(test)]
@@ -114,7 +95,7 @@ mod tests {
         let source = path(0, &"ab".repeat(32));
         let destination = path(1, &"cd".repeat(32));
         assert!(matches!(
-            ChunkPromotion::new(source, destination),
+            ChunkPromotion::from_paths(source, destination),
             Err(Error::DifferentChunk)
         ));
     }
@@ -127,8 +108,8 @@ mod tests {
             "0000000000000000-0000000000000000/name/archive.yml",
         ] {
             assert!(matches!(
-                ChunkPromotion::new(source.into(), destination.clone()),
-                Err(Error::InvalidPath { .. })
+                ChunkPromotion::from_paths(source.into(), destination.clone()),
+                Err(Error::InvalidPath(_))
             ));
         }
     }
@@ -137,13 +118,16 @@ mod tests {
     fn promotion_requires_a_newer_generation() {
         let digest = "ab".repeat(32);
         assert!(matches!(
-            ChunkPromotion::new(path(1, &digest), path(0, &digest)),
+            ChunkPromotion::from_paths(path(1, &digest), path(0, &digest)),
             Err(Error::NotForward)
         ));
         assert!(matches!(
-            ChunkPromotion::new(path(1, &digest), path(1, &digest)),
+            ChunkPromotion::from_paths(path(1, &digest), path(1, &digest)),
             Err(Error::NotForward)
         ));
-        assert!(ChunkPromotion::new(path(0, &digest), path(1, &digest)).is_ok());
+        assert!(
+            ChunkPromotion::from_paths(path(0, &digest), path(1, &digest))
+                .is_ok()
+        );
     }
 }

@@ -485,7 +485,7 @@ mod tests {
             "0000000000000001-0000000000000000/chunk/{}",
             "ab".repeat(32)
         ));
-        let promotion = crate::backends::ChunkPromotion::new(
+        let promotion = crate::backends::ChunkPromotion::from_paths(
             source.clone(),
             destination.clone(),
         )

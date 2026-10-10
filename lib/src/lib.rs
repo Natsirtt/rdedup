@@ -8,7 +8,6 @@ use std::sync::{mpsc, Arc};
 
 use sgdata::SGData;
 use slog::{info, o, warn, FnValue, Level, Logger};
-use slog_perf::TimeReporter;
 use sodiumoxide::crypto::{self, box_, secretbox};
 use url::Url;
 
@@ -321,7 +320,6 @@ impl Repo {
         &'a self,
         input_data_iter: Box<dyn Iterator<Item = Vec<u8>> + Send + 'a>,
         process_tx: crossbeam_channel::Sender<chunk_processor::Message>,
-        aio: aio::AsyncIO,
         data_type: DataType,
     ) -> io::Result<DataAddress> {
         // Note: This channel is intentionally unbounded
@@ -337,79 +335,81 @@ impl Repo {
         let (digests_tx, digests_rx) = mpsc::channel();
 
         crossbeam::scope(move |scope| {
-            let mut timer = slog_perf::TimeReporter::new_with_level(
-                "index-processor",
-                self.log.clone(),
-                Level::Debug,
-            );
-            timer.start("spawn-chunker");
-
-            scope.spawn({
+            let chunker = scope.spawn({
                 let process_tx = process_tx.clone();
-                move |_| {
-                    let mut timer = slog_perf::TimeReporter::new_with_level(
-                        "chunker",
-                        self.log.clone(),
-                        Level::Debug,
-                    );
-
+                move |_| -> io::Result<()> {
                     let chunker = chunking::Chunker::new(
                         input_data_iter,
                         self.config.chunking.to_engine(),
                     );
-
-                    let mut data = EnumerateU64::new(chunker);
-
-                    while let Some(i_sg) =
-                        timer.start_with("rx-and-chunking", || data.next())
-                    {
-                        timer.start("tx");
-                        let (i, sg) = i_sg;
+                    for (index, contents) in EnumerateU64::new(chunker) {
                         process_tx
                             .send(Message {
-                                data: (i, sg),
-                                response_tx: digests_tx.clone(),
+                                sequence: ChunkSequence::new(index),
+                                contents,
+                                response: digests_tx.clone(),
                                 data_type,
                             })
-                            .expect("chunk process tx channel closed")
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "chunk storage workers stopped",
+                                )
+                            })?;
                     }
-                    drop(digests_tx);
+                    Ok(())
                 }
             });
-
-            timer.start("sorting-recv-create");
-            let mut digests_rx = SortingIterator::new(digests_rx.into_iter());
-
-            timer.start("digest-rx");
-            let first_digest =
-                digests_rx.next().expect("At least one index digest");
-
-            if let Some(second_digest) =
-                timer.start_with("digest-rx", || digests_rx.next())
-            {
-                let mut two_first = vec![first_digest, second_digest];
-                let mut address = self.chunk_and_write_data_thread(
-                    Box::new(
-                        two_first
-                            .drain(..)
-                            .chain(digests_rx)
-                            .map(|digest| digest.0),
-                    ),
-                    process_tx,
-                    aio.clone(),
-                    DataType::Index,
-                )?;
-
-                address.index_level += 1;
-                Ok(address)
-            } else {
-                Ok(DataAddress {
-                    index_level: 0,
-                    digest: first_digest,
-                })
-            }
+            let completions = digests_rx.into_iter().map(
+                |completion: chunk_processor::Completion| {
+                    (
+                        completion.sequence.as_index(),
+                        completion.result.map_err(io::Error::from),
+                    )
+                },
+            );
+            let mut digests = SortingIterator::new(completions)
+                .map(|result| result.and_then(|completion| completion));
+            let result = (|| {
+                let first = digests.next().transpose()?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "chunk stream ended without a digest",
+                    )
+                })?;
+                if let Some(second) = digests.next().transpose()? {
+                    let input = [Ok(first), Ok(second)]
+                        .into_iter()
+                        .chain(digests.by_ref())
+                        .map(|result| result.map(|digest| digest.0));
+                    let mut input = WhileOk::new(input);
+                    let address = self.chunk_and_write_data_thread(
+                        Box::new(input.by_ref()),
+                        process_tx,
+                        DataType::Index,
+                    );
+                    if let Some(error) = input.finish() {
+                        return Err(error);
+                    }
+                    let mut address = address?;
+                    address.index_level += 1;
+                    Ok(address)
+                } else {
+                    Ok(DataAddress {
+                        index_level: 0,
+                        digest: first,
+                    })
+                }
+            })();
+            // Closing the completion consumer propagates cancellation through
+            // workers and bounded producers before waiting for their exit.
+            drop(digests);
+            let produced = chunker.join().map_err(worker_panic)?;
+            let address = result?;
+            produced?;
+            Ok(address)
         })
-        .expect("chunker thread failed")
+        .map_err(worker_panic)?
     }
 
     /// Number of threads to use to parallelize CPU-intense part of
@@ -422,26 +422,19 @@ impl Repo {
         &self,
         reader: R,
         chunker_tx: mpsc::SyncSender<Vec<u8>>,
-    ) where
+    ) -> io::Result<()>
+    where
         R: Read + Send,
     {
-        let mut time = TimeReporter::new_with_level(
-            "input-reader",
-            self.log.clone(),
-            Level::Debug,
-        );
-
-        let r2vi = ReaderVecIter::new(reader, INGRESS_BUFFER_SIZE);
-        let mut while_ok = WhileOk::new(r2vi);
-
-        while let Some(buf) = time.start_with("input", || while_ok.next()) {
-            time.start("tx");
-            chunker_tx.send(buf).expect("chunker tx channel closed")
+        for buffer in ReaderVecIter::new(reader, INGRESS_BUFFER_SIZE) {
+            chunker_tx.send(buffer?).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "chunk consumer stopped",
+                )
+            })?;
         }
-
-        if let Some(e) = while_ok.finish() {
-            panic!("Input thread error: {}", e)
-        }
+        Ok(())
     }
 
     fn get_chunk_accessor<'a>(
@@ -821,15 +814,13 @@ impl Repo {
             })
             .filter_map(|item| match Generation::try_from(item) {
                 Ok(gen) => {
-                    if aio.read_metadata(gen.config_path()).wait().is_ok() {
-                        Some(gen)
-                    } else {
-                        warn!(
-                            self.log,
-                            "skipping dead generation: `{}` (config missing)",
-                            item,
-                        );
-                        None
+                    match aio.read_metadata(gen.config_path()).wait() {
+                        Ok(_) => Some(Ok(gen)),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            warn!(self.log, "skipping dead generation: `{}` (config missing)", item);
+                            None
+                        }
+                        Err(error) => Some(Err(error)),
                     }
                 }
                 Err(e) => {
@@ -842,7 +833,7 @@ impl Repo {
                     None
                 }
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
 
         list.sort();
         Ok(list)
@@ -887,7 +878,8 @@ impl Repo {
         let (process_tx, process_rx) = crossbeam_channel::bounded(num_threads);
 
         let data_address = crossbeam::scope(|scope| {
-            scope.spawn(move |_| self.input_reader_thread(reader, chunker_tx));
+            let input = scope
+                .spawn(move |_| self.input_reader_thread(reader, chunker_tx));
 
             for _ in 0..num_threads {
                 let process_rx = process_rx.clone();
@@ -915,29 +907,29 @@ impl Repo {
                 self.chunk_and_write_data_thread(
                     Box::new(chunker_rx.into_iter()),
                     process_tx,
-                    write_aio,
                     DataType::Data,
                 )
             });
 
-            chunk_and_write.join()
+            let chunks = chunk_and_write.join().map_err(worker_panic)?;
+            let input = input.join().map_err(worker_panic)?;
+            let address = chunks?;
+            input?;
+            Ok::<_, io::Error>(address)
         })
-        .expect("non-joined thread panicked (chunk processor?)");
+        .map_err(worker_panic)??;
 
-        let data_address = data_address.map_err(|e| {
-            if let Some(io_e) = e.downcast_ref::<io::Error>() {
-                io::Error::new(io_e.kind(), format!("{}", io_e))
-            } else {
-                io::Error::other(format!("{:?}", e))
-            }
-        })?;
-
-        let name: Name = data_address?.into();
-        name.write_as(name_str, *generations.last().unwrap(), &aio)?;
+        drop(write_aio);
+        let name: Name = data_address.into();
+        name.write_as(name_str, &generations, &aio)?;
         Ok(stats.get_stats())
     }
 }
 // }}}
+
+fn worker_panic(_payload: Box<dyn std::any::Any + Send>) -> io::Error {
+    io::Error::other("repository worker panicked")
+}
 
 #[cfg(test)]
 mod tests;

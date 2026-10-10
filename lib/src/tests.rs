@@ -673,6 +673,304 @@ fn reading_a_legacy_name_does_not_rewrite_it() {
     wipe(&repository);
 }
 
+mod write_failures {
+    use super::*;
+    use crate::aio::local::Local;
+    use crate::backends::{
+        Backend, BackendOperation, BackendThread, BackendWorker,
+        ChunkPromotion, Exclusive, Metadata, OperationState, Shared,
+    };
+    use crate::SGData;
+
+    #[derive(Clone, Copy)]
+    enum Failure {
+        Upload,
+        Metadata,
+        Promotion,
+        GenerationMetadata,
+    }
+
+    struct FailingBackend {
+        path: PathBuf,
+        failure: Failure,
+    }
+    struct FailingOperation {
+        local: BackendOperation<Shared>,
+        failure: Failure,
+    }
+    struct FailingWorker {
+        local: BackendWorker<Shared>,
+        failure: Failure,
+    }
+
+    impl Backend for FailingBackend {
+        fn begin_shared(&self) -> io::Result<BackendOperation<Shared>> {
+            Ok(BackendOperation::new(FailingOperation {
+                local: Local::new(self.path.clone()).begin_shared()?,
+                failure: self.failure,
+            }))
+        }
+        fn begin_exclusive(&self) -> io::Result<BackendOperation<Exclusive>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "test uses shared operations",
+            ))
+        }
+    }
+    impl OperationState for FailingOperation {
+        fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
+            Ok(Box::new(FailingWorker {
+                local: self.local.new_thread()?,
+                failure: self.failure,
+            }))
+        }
+    }
+    fn injected() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected storage failure",
+        )
+    }
+    fn is_chunk(path: &std::path::Path) -> bool {
+        path.components()
+            .any(|component| component.as_os_str() == "chunk")
+    }
+    impl BackendThread for FailingWorker {
+        fn write(
+            &mut self,
+            path: PathBuf,
+            contents: SGData,
+            idempotent: bool,
+        ) -> io::Result<()> {
+            assert!(idempotent);
+            if matches!(self.failure, Failure::Upload) && is_chunk(&path) {
+                return Err(injected());
+            }
+            self.local.create(path, contents)
+        }
+        fn read(&mut self, path: PathBuf) -> io::Result<SGData> {
+            self.local.read(path)
+        }
+        fn read_metadata(&mut self, path: PathBuf) -> io::Result<Metadata> {
+            if (matches!(self.failure, Failure::Metadata) && is_chunk(&path))
+                || (matches!(self.failure, Failure::GenerationMetadata)
+                    && path.components().count() == 2
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name == "config.yml"))
+            {
+                return Err(injected());
+            }
+            self.local.read_metadata(path)
+        }
+        fn promote_chunk(
+            &mut self,
+            promotion: ChunkPromotion,
+        ) -> io::Result<()> {
+            if matches!(self.failure, Failure::Promotion) {
+                return Err(injected());
+            }
+            self.local.promote_chunk(promotion)
+        }
+        fn list(&mut self, path: PathBuf) -> io::Result<Vec<PathBuf>> {
+            self.local.list(path)
+        }
+        fn list_recursively(
+            &mut self,
+            path: PathBuf,
+            sender: std::sync::mpsc::Sender<io::Result<Vec<PathBuf>>>,
+        ) {
+            self.local.list_recursively(path, sender);
+        }
+        fn remove(&mut self, _: PathBuf) -> io::Result<()> {
+            panic!("shared worker must not remove")
+        }
+        fn remove_dir_all(&mut self, _: PathBuf) -> io::Result<()> {
+            panic!("shared worker must not remove directories")
+        }
+        fn rename(&mut self, _: PathBuf, _: PathBuf) -> io::Result<()> {
+            panic!("shared worker must not rename")
+        }
+    }
+    fn inject(repository: &mut lib::Repo, path: PathBuf, failure: Failure) {
+        repository.backend = Arc::new(FailingBackend { path, failure });
+    }
+
+    #[test]
+    fn chunk_upload_and_lookup_errors_reach_the_caller_without_publication() {
+        for failure in [Failure::Upload, Failure::Metadata] {
+            let (mut repository, directory) = test_repo_dir(PASS);
+            let encryption =
+                repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+            inject(&mut repository, directory.clone(), failure);
+            let error = repository
+                .write(
+                    "failed",
+                    io::Cursor::new(vec![7; 2 * 1024 * 1024]),
+                    &encryption,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(repository.list_names().unwrap().is_empty());
+            drop(repository);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn promotion_failure_prevents_publication() {
+        let (mut repository, directory) = test_repo_dir(PASS);
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+        repository
+            .write("original", io::Cursor::new(b"archive bytes"), &encryption)
+            .unwrap();
+        let operation = repository.backend.begin_shared().unwrap();
+        let aio = crate::aio::AsyncIO::new(operation, repository.log.clone())
+            .unwrap();
+        let generations = repository.read_generations(&aio).unwrap();
+        generations.last().unwrap().gen_next().write(&aio).unwrap();
+        drop(aio);
+        inject(&mut repository, directory.clone(), Failure::Promotion);
+        let error = repository
+            .write("failed", io::Cursor::new(b"archive bytes"), &encryption)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(repository.list_names().unwrap(), ["original"]);
+        drop(repository);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn generation_lookup_failure_cannot_be_treated_as_an_empty_repository() {
+        let (mut repository, directory) = test_repo_dir(PASS);
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+        repository
+            .write("original", io::Cursor::new(b"original"), &encryption)
+            .unwrap();
+        inject(
+            &mut repository,
+            directory.clone(),
+            Failure::GenerationMetadata,
+        );
+        let error = repository
+            .write("failed", io::Cursor::new(b"new"), &encryption)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        drop(repository);
+        let local = lib::Repo::open_from_url(
+            Arc::new(Url::from_file_path(&directory).unwrap()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(local.list_names().unwrap(), ["original"]);
+        drop(local);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    struct FailingReader;
+    impl io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(injected())
+        }
+    }
+    #[test]
+    fn input_failure_returns_without_publishing_a_partial_archive() {
+        use io::Read;
+        let repository = test_repo(PASS);
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+        let input =
+            io::Cursor::new(vec![5; 2 * 1024 * 1024]).chain(FailingReader);
+        let error = repository.write("failed", input, &encryption).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(repository.list_names().unwrap().is_empty());
+        wipe(&repository);
+    }
+}
+
+#[test]
+fn a_name_in_an_older_generation_cannot_be_replaced_by_a_new_write() {
+    let (repository, directory) = test_repo_dir(PASS);
+    let encryption = repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+    repository
+        .write("archive", io::Cursor::new(b"original"), &encryption)
+        .unwrap();
+    let operation = repository.backend.begin_exclusive().unwrap();
+    let aio =
+        crate::aio::ExclusiveAsyncIO::new(operation, repository.log.clone())
+            .unwrap();
+    let generations = repository.read_generations(aio.shared()).unwrap();
+    generations
+        .last()
+        .unwrap()
+        .gen_next()
+        .write(aio.shared())
+        .unwrap();
+    drop(aio);
+    let error = repository
+        .write("archive", io::Cursor::new(b"different"), &encryption)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    repository
+        .write("archive", io::Cursor::new(b"original"), &encryption)
+        .unwrap();
+    assert_eq!(repository.list_names().unwrap(), ["archive"]);
+    let decryption = repository.unlock_decrypt(&|| Ok(PASS.into())).unwrap();
+    let mut contents = Vec::new();
+    repository
+        .read("archive", &mut contents, &decryption)
+        .unwrap();
+    assert_eq!(contents, b"original");
+    drop(repository);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn concurrent_first_publications_share_one_name_namespace() {
+    let repository = test_repo(PASS);
+    // Both writers take their initial snapshot before either creates it.
+    let first_generation = crate::Generation::gen_first();
+    let second_generation = crate::Generation::gen_first();
+    let first_operation = repository.backend.begin_shared().unwrap();
+    let second_operation = repository.backend.begin_shared().unwrap();
+    let first_io =
+        crate::aio::AsyncIO::new(first_operation, repository.log.clone())
+            .unwrap();
+    let second_io =
+        crate::aio::AsyncIO::new(second_operation, repository.log.clone())
+            .unwrap();
+    first_generation.write(&first_io).unwrap();
+    second_generation.write(&second_io).unwrap();
+    let first_name = crate::name::Name {
+        digest: vec![1; 32],
+        index_level: 0,
+        created: chrono::Utc::now(),
+    };
+    let second_name = crate::name::Name {
+        digest: vec![2; 32],
+        index_level: 0,
+        created: first_name.created,
+    };
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            first_name.write_as("race", &[first_generation], &first_io)
+        });
+        let second = scope.spawn(|| {
+            second_name.write_as("race", &[second_generation], &second_io)
+        });
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_ne!(first.is_ok(), second.is_ok());
+    let error = first.err().or_else(|| second.err()).unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    drop(first_io);
+    drop(second_io);
+    assert_eq!(repository.list_names().unwrap(), ["race"]);
+    wipe(&repository);
+}
+
 #[test]
 fn a_repository_reuses_its_backend_across_operations_and_clones() {
     use std::sync::atomic::{AtomicUsize, Ordering};

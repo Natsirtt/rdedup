@@ -112,10 +112,9 @@ impl Generation {
     }
 
     pub(crate) fn gen_first() -> Self {
-        Generation {
-            seq: 0,
-            rand: rand::rng().next_u64(),
-        }
+        // Concurrent first writers must publish into the same namespace so
+        // atomic name creation also enforces repository-wide uniqueness.
+        Generation { seq: 0, rand: 0 }
     }
 
     pub(crate) fn config_path(&self) -> PathBuf {

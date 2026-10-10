@@ -134,9 +134,34 @@ impl Name {
     pub fn write_as(
         &self,
         name: &str,
-        gen: Generation,
+        generations: &[Generation],
         aio: &aio::AsyncIO,
     ) -> io::Result<()> {
+        let mut equivalent_exists = false;
+        for generation in generations.iter().rev() {
+            match Name::try_deserialize(name, *generation, aio) {
+                Ok(existing) if self.has_same_contents(&existing) => {
+                    equivalent_exists = true
+                }
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "name already exists with different contents",
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if equivalent_exists {
+            return Ok(());
+        }
+        let gen = *generations.last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "name publication requires a generation",
+            )
+        })?;
         let serialized_str =
             serde_yaml::to_string(self).expect("yaml serialization failed");
 
@@ -155,9 +180,7 @@ impl Name {
         }
 
         let existing = Name::try_deserialize(name, gen, aio)?;
-        if self.digest == existing.digest
-            && self.index_level == existing.index_level
-        {
+        if self.has_same_contents(&existing) {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -165,6 +188,10 @@ impl Name {
                 "name already exists with different contents",
             ))
         }
+    }
+
+    fn has_same_contents(&self, other: &Self) -> bool {
+        self.digest == other.digest && self.index_level == other.index_level
     }
 
     /// Attempts to deserialize `path` as a `Name`. For backwards compatibility,

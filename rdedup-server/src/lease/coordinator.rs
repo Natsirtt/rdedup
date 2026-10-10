@@ -72,6 +72,30 @@ pub struct LeaseCheck {
 }
 
 impl LeaseCheck {
+    /// Wait for this lease to expire, be released, or lose its coordinator.
+    ///
+    /// Extensions update the timer for this exact lease. Waiting does not keep
+    /// filesystem protection alive, so stalled transport can drop its stream.
+    pub async fn wait_until_lost(&mut self) -> Error {
+        loop {
+            if let Err(error) = self.ensure_active() {
+                return error;
+            }
+            let validity = *self.validity.borrow();
+            let Validity::Active { expires } = validity else {
+                return Error::Rejected(ProblemKind::LeaseExpired);
+            };
+            tokio::select! {
+                changed = self.validity.changed() => {
+                    if changed.is_err() {
+                        return Error::Stopped;
+                    }
+                }
+                _ = tokio::time::sleep_until(expires.into()) => {}
+            }
+        }
+    }
+
     /// Check permission immediately before an object I/O step or publication.
     ///
     /// # Errors
@@ -728,5 +752,58 @@ impl Coordinator {
             }
         }
         self.refresh(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn expiry_wakes_a_stalled_transport_without_a_coordinator_update() {
+        let (_sender, validity) = watch::channel(Validity::Active {
+            expires: Instant::now() + Duration::from_millis(20),
+        });
+        let mut check = LeaseCheck { validity };
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            check.wait_until_lost(),
+        )
+        .await
+        .expect("expiration must wake the transport");
+        assert!(matches!(error, Error::Rejected(ProblemKind::LeaseExpired)));
+    }
+
+    #[tokio::test]
+    async fn release_and_coordinator_shutdown_wake_a_stalled_transport() {
+        for shutdown in [false, true] {
+            let (sender, validity) = watch::channel(Validity::Active {
+                expires: Instant::now() + Duration::from_secs(60),
+            });
+            let mut check = LeaseCheck { validity };
+            let waiter =
+                tokio::spawn(async move { check.wait_until_lost().await });
+            if shutdown {
+                drop(sender);
+            } else {
+                sender.send_replace(Validity::Expired);
+                // Keep the channel open so the observable reason is release.
+                let error =
+                    tokio::time::timeout(Duration::from_secs(5), waiter)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(matches!(
+                    error,
+                    Error::Rejected(ProblemKind::LeaseExpired)
+                ));
+                continue;
+            }
+            let error = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(error, Error::Stopped));
+        }
     }
 }

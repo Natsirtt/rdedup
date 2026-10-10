@@ -52,6 +52,12 @@ impl From<Name> for DataAddress {
 pub(crate) struct Digest(pub(crate) Vec<u8>);
 
 impl Digest {
+    pub(crate) fn from_hex(text: &str) -> Result<Self, hex::FromHexError> {
+        let mut digest = [0; crate::DIGEST_SIZE];
+        hex::decode_to_slice(text, &mut digest)?;
+        Ok(Self(digest.to_vec()))
+    }
+
     pub(crate) fn as_digest_ref(&self) -> DigestRef<'_> {
         DigestRef(self.0.as_slice())
     }

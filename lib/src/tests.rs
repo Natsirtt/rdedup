@@ -32,7 +32,7 @@ fn rand_tmp_dir() -> PathBuf {
 }
 
 fn list_stored_chunks(repo: &lib::Repo) -> Result<HashSet<Vec<u8>>> {
-    let operation = (repo.backend_select)()?.begin_shared()?;
+    let operation = repo.backend.begin_shared()?;
     let aio = crate::aio::AsyncIO::new(operation, repo.log.clone())?;
     let mut digests = HashSet::new();
     let data_chunks = StoredChunks::new(
@@ -339,8 +339,7 @@ fn verify_name() {
 
     // Corrupt first chunk we find
     let generations = {
-        let operation =
-            (repo.backend_select)().unwrap().begin_shared().unwrap();
+        let operation = repo.backend.begin_shared().unwrap();
         let aio =
             crate::aio::AsyncIO::new(operation, repo.log.clone()).unwrap();
         repo.read_generations(&aio).unwrap()
@@ -564,7 +563,7 @@ impl lib::backends::Backend for FailingLockBackend {
 
 fn repo_with_failing_locks() -> lib::Repo {
     let mut repository = test_repo(PASS);
-    repository.backend_select = Arc::new(|| Ok(Box::new(FailingLockBackend)));
+    repository.backend = Arc::new(FailingLockBackend);
     repository
 }
 
@@ -649,10 +648,7 @@ fn reading_a_legacy_name_does_not_rewrite_it() {
     repository
         .write("legacy", io::Cursor::new(b"archive bytes"), &encryption)
         .unwrap();
-    let operation = (repository.backend_select)()
-        .unwrap()
-        .begin_shared()
-        .unwrap();
+    let operation = repository.backend.begin_shared().unwrap();
     let aio =
         crate::aio::AsyncIO::new(operation, repository.log.clone()).unwrap();
     let generations = repository.read_generations(&aio).unwrap();
@@ -797,12 +793,7 @@ mod write_failures {
         }
     }
     fn inject(repository: &mut lib::Repo, path: PathBuf, failure: Failure) {
-        repository.backend_select = Arc::new(move || {
-            Ok(Box::new(FailingBackend {
-                path: path.clone(),
-                failure,
-            }))
-        });
+        repository.backend = Arc::new(FailingBackend { path, failure });
     }
 
     #[test]
@@ -834,10 +825,7 @@ mod write_failures {
         repository
             .write("original", io::Cursor::new(b"archive bytes"), &encryption)
             .unwrap();
-        let operation = (repository.backend_select)()
-            .unwrap()
-            .begin_shared()
-            .unwrap();
+        let operation = repository.backend.begin_shared().unwrap();
         let aio = crate::aio::AsyncIO::new(operation, repository.log.clone())
             .unwrap();
         let generations = repository.read_generations(&aio).unwrap();
@@ -909,10 +897,7 @@ fn a_name_in_an_older_generation_cannot_be_replaced_by_a_new_write() {
     repository
         .write("archive", io::Cursor::new(b"original"), &encryption)
         .unwrap();
-    let operation = (repository.backend_select)()
-        .unwrap()
-        .begin_exclusive()
-        .unwrap();
+    let operation = repository.backend.begin_exclusive().unwrap();
     let aio =
         crate::aio::ExclusiveAsyncIO::new(operation, repository.log.clone())
             .unwrap();
@@ -948,14 +933,8 @@ fn concurrent_first_publications_share_one_name_namespace() {
     // Both writers take their initial snapshot before either creates it.
     let first_generation = crate::Generation::gen_first();
     let second_generation = crate::Generation::gen_first();
-    let first_operation = (repository.backend_select)()
-        .unwrap()
-        .begin_shared()
-        .unwrap();
-    let second_operation = (repository.backend_select)()
-        .unwrap()
-        .begin_shared()
-        .unwrap();
+    let first_operation = repository.backend.begin_shared().unwrap();
+    let second_operation = repository.backend.begin_shared().unwrap();
     let first_io =
         crate::aio::AsyncIO::new(first_operation, repository.log.clone())
             .unwrap();
@@ -990,4 +969,80 @@ fn concurrent_first_publications_share_one_name_namespace() {
     drop(second_io);
     assert_eq!(repository.list_names().unwrap(), ["race"]);
     wipe(&repository);
+}
+
+#[test]
+fn a_repository_reuses_its_backend_across_operations_and_clones() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = rand_tmp_dir();
+    let selections = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&selections);
+    let selected_directory = directory.clone();
+    let select: Arc<lib::BackendSelectFn> = Arc::new(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(lib::backends::local::Local::new(
+            selected_directory.clone(),
+        )))
+    });
+    let mut settings = settings::Repo::new();
+    settings.set_pwhash(settings::PWHash::Weak);
+    let repository =
+        lib::Repo::init(select, &|| Ok(PASS.into()), settings, None).unwrap();
+    repository.list_names().unwrap();
+    repository.clone().list_names().unwrap();
+    assert_eq!(selections.load(Ordering::SeqCst), 1);
+    drop(repository);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn cache_population_uses_shared_protection_and_preserves_storage_errors() {
+    use lib::backends::{local::Local, local_cache::LocalCache, Backend};
+    use sgdata::SGData;
+    let cache_directory = rand_tmp_dir();
+    let remote_directory = rand_tmp_dir();
+    let remote = Local::new(remote_directory.clone());
+    let operation = remote.begin_shared().unwrap();
+    let mut worker = operation.new_thread().unwrap();
+    worker
+        .create(
+            "object".into(),
+            SGData::from_single(b"stored bytes".to_vec()),
+        )
+        .unwrap();
+    worker
+        .create(
+            "broken".into(),
+            SGData::from_single(b"remote fallback".to_vec()),
+        )
+        .unwrap();
+    drop(worker);
+    drop(operation);
+    let cache = LocalCache::new(cache_directory.clone(), Box::new(remote));
+    let operation = cache.begin_shared().unwrap();
+    let observer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(cache_directory.join(".lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_shared(&observer).unwrap();
+    fs2::FileExt::unlock(&observer).unwrap();
+    assert!(fs2::FileExt::try_lock_exclusive(&observer).is_err());
+    let mut worker = operation.new_thread().unwrap();
+    assert_eq!(
+        worker.read("object".into()).unwrap().into_linear_vec(),
+        b"stored bytes"
+    );
+    assert_eq!(
+        fs::read(cache_directory.join("object")).unwrap(),
+        b"stored bytes"
+    );
+    fs::create_dir(cache_directory.join("broken")).unwrap();
+    assert!(worker.read("broken".into()).is_err());
+    drop(worker);
+    drop(operation);
+    drop(observer);
+    drop(cache);
+    fs::remove_dir_all(cache_directory).unwrap();
+    fs::remove_dir_all(remote_directory).unwrap();
 }

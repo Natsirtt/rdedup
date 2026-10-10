@@ -52,13 +52,10 @@ impl Backend for LocalCache {
 
     fn begin_shared(&self) -> std::io::Result<BackendOperation<Shared>> {
         let remote = self.remote.begin_shared()?;
-        // Cache misses populate local storage; exclusive local protection also
-        // excludes local cache maintenance until this operation finishes.
-        let local = self.local.begin_exclusive()?;
-        Ok(BackendOperation::new(CacheOperation {
-            local: local.shared(),
-            remote,
-        }))
+        // Cache fills create missing entries atomically. Shared protection also
+        // excludes destructive cache maintenance without serializing readers.
+        let local = self.local.begin_shared()?;
+        Ok(BackendOperation::new(CacheOperation { local, remote }))
     }
 }
 
@@ -82,8 +79,8 @@ impl BackendThread for LocalCacheThread {
         }
     }
 
-    // We generally delegate the write operation to the remote store first; and then duplicate them locally if it succeeded only.
-    // Read operations try to hit the local cache first, and delegate to the remote on error (assuming there was no cached value).
+    // Writes reach the authoritative store before updating the optional cache.
+    // Reads fall back to the remote only when the cached entry is absent.
 
     fn remove_dir_all(&mut self, path: PathBuf) -> std::io::Result<()> {
         let result = self.remote.thread.remove_dir_all(path.clone());
@@ -128,15 +125,14 @@ impl BackendThread for LocalCacheThread {
         let result = self.local.thread.read(path.clone());
         match result {
             Ok(data) => Ok(data),
-            Err(_) => {
-                // TODO: check if different errors can occur, and only fetch from remote when it's an expected "no such file" or similar error?
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 match self.remote.thread.read(path.clone()) {
                     Ok(data) => {
                         let cache_result =
-                            self.local.thread.write(path, data.clone(), false);
+                            self.local.thread.write(path, data.clone(), true);
                         if cache_result.is_err() {
-                            // Return an Err anyway? Or how can we both soft-report and error without critically failing since
-                            // technically we do have the data. Anything better than eprintln?
+                            // The authoritative read succeeded; failure to fill
+                            // this optional cache does not invalidate its bytes.
                             eprintln!("Successfully read data from remote; but failed to cache it!");
                         }
                         Ok(data)
@@ -144,6 +140,7 @@ impl BackendThread for LocalCacheThread {
                     Err(e) => Err(e),
                 }
             }
+            Err(error) => Err(error),
         }
     }
 

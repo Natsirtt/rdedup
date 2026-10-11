@@ -620,3 +620,137 @@ async fn a_stalled_download_releases_storage_on_lease_loss_without_client_reads(
     );
     drop(connection);
 }
+
+#[tokio::test]
+async fn directory_streams_filter_internal_entries_and_require_completion() {
+    use rdedup_protocol::object::{DirectoryQuery, ListScope, ListingRecord};
+    use std::collections::BTreeSet;
+    let server = Server::start(false).await;
+    let token = "ab".repeat(32);
+    let root = server._directory.path().join("repository");
+    let generation = "0000000000000000-0000000000000000";
+    let name = format!("{generation}/name/archive.yml");
+    let chunk = format!("{generation}/chunk/{}", "ab".repeat(32));
+    let generation_configuration = format!("{generation}/config.yml");
+    for path in ["config.yml", &generation_configuration, &name, &chunk] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"stored").unwrap();
+    }
+    std::fs::write(
+        root.join(format!("{generation}/name/upload.random.tmp")),
+        b"staging",
+    )
+    .unwrap();
+    std::fs::write(root.join("unrelated"), b"not published").unwrap();
+    let request = LeaseRequestId::generate();
+    server
+        .acquire(request, LeaseMode::Shared, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    let lease = server.granted(request, Some(&token)).await;
+    let url = format!("{}{}", server.address, route::DIRECTORIES);
+    for scope in [ListScope::Immediate, ListScope::Recursive] {
+        let response = server
+            .client
+            .get(&url)
+            .query(&DirectoryQuery { path: None, scope })
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert_eq!(
+            response.headers()["content-type"],
+            route::LISTING_CONTENT_TYPE
+        );
+        let text = response.text().await.unwrap();
+        let mut records = text
+            .lines()
+            .map(|line| serde_json::from_str::<ListingRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(records.pop(), Some(ListingRecord::Complete)));
+        let paths = records
+            .into_iter()
+            .map(|record| match record {
+                ListingRecord::Entry { path } => path.as_str().to_owned(),
+                other => panic!("unexpected listing record: {other:?}"),
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = match scope {
+            ListScope::Immediate => {
+                BTreeSet::from(["config.yml".to_owned(), generation.to_owned()])
+            }
+            ListScope::Recursive => BTreeSet::from([
+                "config.yml".to_owned(),
+                generation_configuration.clone(),
+                name.clone(),
+                chunk.clone(),
+            ]),
+        };
+        assert_eq!(paths, expected);
+    }
+    problem(
+        server
+            .client
+            .delete(&url)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .send()
+            .await
+            .unwrap(),
+        ProblemKind::InvalidRequest,
+    )
+    .await;
+    let query = DirectoryQuery {
+        path: Some(generation.parse().unwrap()),
+        scope: ListScope::Immediate,
+    };
+    problem(
+        server
+            .client
+            .delete(&url)
+            .query(&query)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .send()
+            .await
+            .unwrap(),
+        ProblemKind::LeaseMode,
+    )
+    .await;
+    server
+        .client
+        .delete(format!("{}{}/{}", server.address, route::LEASES, lease.id))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let request = LeaseRequestId::generate();
+    server
+        .acquire(request, LeaseMode::Exclusive, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    let exclusive = server.granted(request, Some(&token)).await;
+    assert_eq!(
+        server
+            .client
+            .delete(&url)
+            .query(&query)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, exclusive.id.to_string())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert!(!root.join(generation).exists());
+    assert!(root.join("config.yml").is_file());
+}

@@ -1,7 +1,8 @@
 //! Object streams check their originating lease between bounded I/O steps.
 use super::{ExclusivePermit, LeaseCheck, SharedPermit, Writable};
 use rdedup_lib::backends::local::{
-    PendingObject, Publication, StoredObject, StreamError,
+    DirectoryEntry, PendingObject, Publication, StoredEntries, StoredObject,
+    StreamError,
 };
 use rdedup_lib::backends::{ChunkPromotion, Metadata};
 use std::io::{self, Read, Write};
@@ -19,6 +20,40 @@ pub enum Error {
     /// A filesystem object operation failed.
     #[error("repository object I/O failed")]
     Storage(#[from] io::Error),
+}
+
+/// A protected listing that terminates after exhaustion or its first failure.
+pub struct LeaseEntries {
+    entries: Option<StoredEntries>,
+    validity: LeaseCheck,
+}
+
+impl LeaseEntries {
+    pub(crate) fn lease_check(&self) -> LeaseCheck {
+        self.validity.clone()
+    }
+}
+
+impl Iterator for LeaseEntries {
+    type Item = Result<DirectoryEntry, Error>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let entries = self.entries.as_mut()?;
+        if let Err(error) = self.validity.ensure_active() {
+            self.entries = None;
+            return Some(Err(error.into()));
+        }
+        match entries.next() {
+            Some(Ok(entry)) => Some(Ok(entry)),
+            Some(Err(error)) => {
+                self.entries = None;
+                Some(Err(error.into()))
+            }
+            None => {
+                self.entries = None;
+                None
+            }
+        }
+    }
 }
 
 /// A stored object whose reads cannot continue under an expired lease.
@@ -75,6 +110,31 @@ impl LeaseWriter {
 }
 
 impl<Access> SharedPermit<Access> {
+    /// Open an incremental immediate listing under this lease.
+    ///
+    /// # Errors
+    /// Returns lease loss or failure to open the directory.
+    pub fn read_directory(&self, path: &Path) -> Result<LeaseEntries, Error> {
+        self.validity.ensure_active()?;
+        Ok(LeaseEntries {
+            entries: Some(self.operation.read_directory(path)?),
+            validity: self.validity.clone(),
+        })
+    }
+
+    /// Open an incremental recursive file listing under this lease.
+    ///
+    /// # Errors
+    /// Returns lease loss or failure to open the traversal root. Later failures
+    /// are yielded once by the iterator, which then terminates.
+    pub fn walk_directory(&self, path: &Path) -> Result<LeaseEntries, Error> {
+        self.validity.ensure_active()?;
+        Ok(LeaseEntries {
+            entries: Some(self.operation.walk_directory(path)?),
+            validity: self.validity.clone(),
+        })
+    }
+
     /// Open a streaming read retaining this lease's local protection.
     ///
     /// # Errors

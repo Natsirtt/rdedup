@@ -19,7 +19,7 @@ pub(crate) enum Error {
 }
 
 impl Error {
-    fn kind(&self) -> ProblemKind {
+    pub(crate) fn kind(&self) -> ProblemKind {
         match self {
             Self::Problem(kind) => *kind,
             Self::Object(crate::lease::ObjectError::Lease(error)) => {

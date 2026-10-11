@@ -97,6 +97,10 @@ pub fn router(configuration: Configuration) -> Router {
     });
     Router::new()
         .route(
+            route::DIRECTORIES,
+            get(crate::directory::list).delete(crate::directory::remove),
+        )
+        .route(
             &route::object_pattern(),
             get(crate::object::get)
                 .head(crate::object::head)

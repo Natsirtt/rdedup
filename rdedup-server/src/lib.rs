@@ -6,6 +6,7 @@ mod authentication;
 pub mod configuration;
 mod setting;
 
+mod directory;
 mod object;
 mod response;
 pub mod server;

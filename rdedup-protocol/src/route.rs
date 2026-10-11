@@ -3,6 +3,8 @@
 pub const OBJECTS: &str = "/api/v1/objects";
 /// Directory listing and exclusive removal endpoint.
 pub const DIRECTORIES: &str = "/api/v1/directories";
+/// Content type for newline-delimited `ListingRecord` values.
+pub const LISTING_CONTENT_TYPE: &str = "application/x-ndjson";
 /// General exclusive rename endpoint.
 pub const RENAMES: &str = "/api/v1/renames";
 /// Additive chunk promotion endpoint.

@@ -2,21 +2,20 @@
 use crate::lease::{LeaseReader, LeaseWriter};
 use crate::response::Error;
 use crate::server::Repository;
+use crate::transfer::{BodyPiece, ResponseStream};
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use rdedup_lib::backends::local::Publication;
 use rdedup_lib::backends::{Metadata, ObjectPath};
 use rdedup_protocol::object::RepositoryPath;
 use rdedup_protocol::problem::ProblemKind;
 use rdedup_protocol::route;
 use std::io::{self, Read, Write};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
 const TRANSFER_BUFFER_SIZE: usize = 128 * 1024;
@@ -48,7 +47,10 @@ pub(crate) async fn get(
     let response_headers = metadata_headers(&opened.metadata)?;
     let (sender, receiver) = mpsc::channel(2);
     tokio::spawn(download(opened.reader, sender));
-    Ok((response_headers, Body::from_stream(Download { receiver }))
+    Ok((
+        response_headers,
+        Body::from_stream(ResponseStream::new(receiver)),
+    )
         .into_response())
 }
 
@@ -160,34 +162,7 @@ impl ReadStep {
     }
 }
 
-enum DownloadPiece {
-    Bytes(Bytes),
-    Failed(io::Error),
-}
-
-struct Download {
-    receiver: mpsc::Receiver<DownloadPiece>,
-}
-
-impl Stream for Download {
-    type Item = io::Result<Bytes>;
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(context).map(|piece| {
-            piece.map(|piece| match piece {
-                DownloadPiece::Bytes(bytes) => Ok(bytes),
-                DownloadPiece::Failed(error) => Err(error),
-            })
-        })
-    }
-}
-
-async fn download(
-    mut reader: LeaseReader,
-    sender: mpsc::Sender<DownloadPiece>,
-) {
+async fn download(mut reader: LeaseReader, sender: mpsc::Sender<BodyPiece>) {
     let mut validity = reader.lease_check();
     loop {
         let step =
@@ -196,24 +171,23 @@ async fn download(
             {
                 Ok(step) => step,
                 Err(error) => {
-                    let _ = sender.try_send(DownloadPiece::Failed(
-                        io::Error::other(error),
-                    ));
+                    let _ = sender
+                        .try_send(BodyPiece::Failed(io::Error::other(error)));
                     return;
                 }
             };
         reader = step.reader;
         let piece = match step.bytes {
             Ok(bytes) if bytes.is_empty() => return,
-            Ok(bytes) => DownloadPiece::Bytes(bytes),
+            Ok(bytes) => BodyPiece::Bytes(bytes),
             Err(error) => {
-                let _ = sender.try_send(DownloadPiece::Failed(error));
+                let _ = sender.try_send(BodyPiece::Failed(error));
                 return;
             }
         };
         tokio::select! {
             error = validity.wait_until_lost() => {
-                let _ = sender.try_send(DownloadPiece::Failed(io::Error::other(error)));
+                let _ = sender.try_send(BodyPiece::Failed(io::Error::other(error)));
                 return;
             }
             sent = sender.send(piece) => {

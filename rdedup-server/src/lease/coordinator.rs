@@ -88,7 +88,7 @@ impl LeaseCheck {
             tokio::select! {
                 changed = self.validity.changed() => {
                     if changed.is_err() {
-                        return Error::Stopped;
+                        return Error::Rejected(ProblemKind::LeaseExpired);
                     }
                 }
                 _ = tokio::time::sleep_until(expires.into()) => {}
@@ -102,7 +102,7 @@ impl LeaseCheck {
     /// Returns lease loss after expiry, release, or coordinator shutdown.
     pub fn ensure_active(&self) -> Result<(), Error> {
         if self.validity.has_changed().is_err() {
-            return Err(Error::Stopped);
+            return Err(Error::Rejected(ProblemKind::LeaseExpired));
         }
         match *self.validity.borrow() {
             Validity::Active { expires } if Instant::now() < expires => Ok(()),
@@ -775,6 +775,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_closed_notification_channel_is_permanent_lease_loss() {
+        for state in [
+            Validity::Expired,
+            Validity::Active {
+                expires: Instant::now() + Duration::from_secs(60),
+            },
+        ] {
+            let (sender, validity) = watch::channel(state);
+            drop(sender);
+            let mut check = LeaseCheck { validity };
+            assert!(matches!(
+                check.ensure_active(),
+                Err(Error::Rejected(ProblemKind::LeaseExpired))
+            ));
+            assert!(matches!(
+                check.wait_until_lost().await,
+                Error::Rejected(ProblemKind::LeaseExpired)
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn release_and_coordinator_shutdown_wake_a_stalled_transport() {
         for shutdown in [false, true] {
             let (sender, validity) = watch::channel(Validity::Active {
@@ -803,7 +825,10 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(matches!(error, Error::Stopped));
+            assert!(matches!(
+                error,
+                Error::Rejected(ProblemKind::LeaseExpired)
+            ));
         }
     }
 }

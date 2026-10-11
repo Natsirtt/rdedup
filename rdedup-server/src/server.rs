@@ -6,7 +6,7 @@ use crate::response::{self, Error as ResponseError};
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::routing::{get, patch, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use rdedup_protocol::lease::{
     AcquireLease, Acquisition, LeaseId, LeaseMode, LeaseRequestId,
@@ -96,6 +96,8 @@ pub fn router(configuration: Configuration) -> Router {
         reads: configuration.reads,
     });
     Router::new()
+        .route(route::PROMOTIONS, post(crate::mutation::promote))
+        .route(route::RENAMES, post(crate::mutation::rename))
         .route(
             route::DIRECTORIES,
             get(crate::directory::list).delete(crate::directory::remove),

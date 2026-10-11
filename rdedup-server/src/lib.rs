@@ -7,6 +7,7 @@ pub mod configuration;
 mod setting;
 
 mod directory;
+mod mutation;
 mod object;
 mod response;
 pub mod server;

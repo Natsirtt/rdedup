@@ -754,3 +754,164 @@ async fn directory_streams_filter_internal_entries_and_require_completion() {
     assert!(!root.join(generation).exists());
     assert!(root.join("config.yml").is_file());
 }
+
+#[tokio::test]
+async fn chunk_promotion_is_additive_and_rename_remains_exclusive() {
+    use rdedup_lib::backends::ChunkPromotion;
+    use rdedup_protocol::object::Rename;
+    let server = Server::start(false).await;
+    let token = "ab".repeat(32);
+    let root = server._directory.path().join("repository");
+    let old = "0000000000000000-0000000000000000";
+    let new = "0000000000000001-0000000000000000";
+    let source = format!("{old}/chunk/{}", "ab".repeat(32));
+    let destination = format!("{new}/chunk/{}", "ab".repeat(32));
+    std::fs::create_dir_all(root.join(&source).parent().unwrap()).unwrap();
+    std::fs::write(root.join(&source), b"chunk bytes").unwrap();
+    let request = LeaseRequestId::generate();
+    server
+        .acquire(request, LeaseMode::Shared, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    let lease = server.granted(request, Some(&token)).await;
+    let promotion = ChunkPromotion::from_paths(
+        source.clone().into(),
+        destination.clone().into(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            server
+                .client
+                .post(format!("{}{}", server.address, route::PROMOTIONS))
+                .bearer_auth(&token)
+                .header(route::LEASE_HEADER, lease.id.to_string())
+                .json(&promotion)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(std::fs::read(root.join(&source)).unwrap(), b"chunk bytes");
+    assert_eq!(
+        std::fs::read(root.join(&destination)).unwrap(),
+        b"chunk bytes"
+    );
+    let rename = Rename {
+        source: source.parse().unwrap(),
+        destination: destination.parse().unwrap(),
+    };
+    problem(
+        server
+            .client
+            .post(format!("{}{}", server.address, route::RENAMES))
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .json(&rename)
+            .send()
+            .await
+            .unwrap(),
+        ProblemKind::LeaseMode,
+    )
+    .await;
+    problem(server.client.post(format!("{}{}", server.address, route::PROMOTIONS))
+        .bearer_auth(&token).header(route::LEASE_HEADER, lease.id.to_string())
+        .json(&serde_json::json!({"source": destination, "destination": source}))
+        .send().await.unwrap(), ProblemKind::InvalidRequest).await;
+    server
+        .client
+        .delete(format!("{}{}/{}", server.address, route::LEASES, lease.id))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let request = LeaseRequestId::generate();
+    server
+        .acquire(request, LeaseMode::Exclusive, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    let lease = server.granted(request, Some(&token)).await;
+    let source_name = format!("{old}/name/published.yml");
+    let destination_name = format!("{new}/name/published.yml");
+    std::fs::create_dir_all(root.join(&source_name).parent().unwrap()).unwrap();
+    std::fs::write(root.join(&source_name), b"name bytes").unwrap();
+    let rename = Rename {
+        source: source_name.parse().unwrap(),
+        destination: destination_name.parse().unwrap(),
+    };
+    assert_eq!(
+        server
+            .client
+            .post(format!("{}{}", server.address, route::RENAMES))
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .json(&rename)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert!(!root.join(&source_name).exists());
+    assert_eq!(
+        std::fs::read(root.join(&destination_name)).unwrap(),
+        b"name bytes"
+    );
+    let staging = format!("{old}/name/unpublished.random.tmp");
+    std::fs::write(root.join(&staging), b"partial").unwrap();
+    let rename = Rename {
+        source: staging.parse().unwrap(),
+        destination: format!("{new}/name/invalid.yml").parse().unwrap(),
+    };
+    problem(
+        server
+            .client
+            .post(format!("{}{}", server.address, route::RENAMES))
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .json(&rename)
+            .send()
+            .await
+            .unwrap(),
+        ProblemKind::InvalidRequest,
+    )
+    .await;
+    assert!(root.join(staging).is_file());
+    let directory_source = format!("{old}/name/folder");
+    let directory_destination = format!("{new}/name/folder");
+    std::fs::create_dir_all(root.join(&directory_source)).unwrap();
+    std::fs::write(
+        root.join(&directory_source).join("nested.yml"),
+        b"nested name",
+    )
+    .unwrap();
+    let rename = Rename {
+        source: directory_source.parse().unwrap(),
+        destination: directory_destination.parse().unwrap(),
+    };
+    assert_eq!(
+        server
+            .client
+            .post(format!("{}{}", server.address, route::RENAMES))
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .json(&rename)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert!(!root.join(directory_source).exists());
+    assert_eq!(
+        std::fs::read(root.join(directory_destination).join("nested.yml"))
+            .unwrap(),
+        b"nested name"
+    );
+}

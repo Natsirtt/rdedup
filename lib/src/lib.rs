@@ -79,8 +79,9 @@ pub mod backends {
 
     pub mod local {
         pub use crate::aio::local::{
-            Local, LocalOperation, LocalThread, PendingObject, PreparedObject,
-            Publication, StoredObject, StreamError,
+            DirectoryEntry, EntryKind, Local, LocalOperation, LocalThread,
+            PendingObject, PreparedObject, Publication, StoredEntries,
+            StoredObject, StreamError,
         };
     }
 

@@ -25,6 +25,9 @@ pub struct Local {
     path: PathBuf,
 }
 
+mod directory;
+pub use directory::{DirectoryEntry, EntryKind, StoredEntries};
+
 mod stream;
 pub use stream::{
     Error as StreamError, PendingObject, PreparedObject, Publication,
@@ -72,6 +75,23 @@ impl OperationState for LocalWorkerFactory {
 }
 
 impl<Access> LocalOperation<Access> {
+    /// Iterate immediate entries while retaining this operation's protection.
+    ///
+    /// # Errors
+    /// Rejects a missing or non-directory location and directory-open failures.
+    pub fn read_directory(&self, path: &Path) -> io::Result<StoredEntries> {
+        StoredEntries::immediate(Arc::clone(&self.protection), path)
+    }
+
+    /// Iterate files in a directory tree without collecting the entire tree.
+    ///
+    /// # Errors
+    /// Rejects a missing or non-directory root. Traversal failures are yielded
+    /// by the iterator without releasing its protection prematurely.
+    pub fn walk_directory(&self, path: &Path) -> io::Result<StoredEntries> {
+        StoredEntries::recursive(Arc::clone(&self.protection), path)
+    }
+
     /// Share this operation's protection with capability-restricted workers.
     pub fn workers(&self) -> BackendOperation<Access> {
         BackendOperation::new(LocalWorkerFactory {
@@ -428,6 +448,42 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn incremental_listings_retain_protection_and_return_relative_entries() {
+        use super::EntryKind;
+        use std::path::Path;
+        let directory = RepositoryDirectory::new();
+        fs::create_dir(directory.0.join("nested")).unwrap();
+        fs::write(directory.0.join("top"), b"one").unwrap();
+        fs::write(directory.0.join("nested/child"), b"two").unwrap();
+        let backend = Local::new(directory.0.clone());
+        let operation = backend.try_shared_operation().unwrap();
+        let mut listing = operation.read_directory(Path::new("")).unwrap();
+        drop(operation);
+        assert!(backend.try_exclusive_operation().is_err());
+        let mut entries = std::collections::BTreeMap::new();
+        for entry in listing.by_ref() {
+            let entry = entry.unwrap();
+            assert!(entry.as_path().is_relative());
+            entries.insert(entry.as_path().to_owned(), entry.kind());
+        }
+        assert_eq!(entries[Path::new("nested")], EntryKind::Directory);
+        assert_eq!(entries[Path::new("top")], EntryKind::File);
+        assert!(!entries.contains_key(Path::new("nested/child")));
+        drop(listing);
+        let operation = backend.try_exclusive_operation().unwrap();
+        let mut listing =
+            operation.walk_directory(Path::new("nested")).unwrap();
+        drop(operation);
+        assert!(backend.try_shared_operation().is_err());
+        let entry = listing.next().unwrap().unwrap();
+        assert_eq!(entry.as_path(), Path::new("nested/child"));
+        assert_eq!(entry.kind(), EntryKind::File);
+        assert!(listing.next().is_none());
+        drop(listing);
+        assert!(backend.try_shared_operation().is_ok());
     }
 
     fn assert_no_temporary_files(directory: &RepositoryDirectory) {

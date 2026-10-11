@@ -6,6 +6,8 @@ license = "MPL-2.0"
 description = "Shared wire contract for rdedup HTTP repositories"
 
 [dependencies]
+hex = { workspace = true }
+subtle = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }

@@ -1371,9 +1371,11 @@ dependencies = [
 name = "rdedup-protocol"
 version = "3.2.0"
 dependencies = [
+ "hex",
  "http",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror",
  "uuid",
 ]
@@ -1391,7 +1393,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "subtle",
  "tempfile",
  "thiserror",
  "tokio",

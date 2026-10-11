@@ -6,7 +6,7 @@ use crate::response::{self, Error as ResponseError};
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::routing::{patch, put};
+use axum::routing::{get, patch, put};
 use axum::{Json, Router};
 use rdedup_protocol::lease::{
     AcquireLease, Acquisition, LeaseId, LeaseMode, LeaseRequestId,
@@ -31,6 +31,24 @@ pub(crate) struct Repository {
 }
 
 impl Repository {
+    pub(crate) fn lease_id(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<LeaseId, ResponseError> {
+        let mut values = headers.get_all(route::LEASE_HEADER).iter();
+        let value = values
+            .next()
+            .ok_or(ResponseError::Problem(ProblemKind::LeaseRequired))?;
+        if values.next().is_some() {
+            return Err(ResponseError::Problem(ProblemKind::InvalidRequest));
+        }
+        value
+            .to_str()
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .ok_or(ResponseError::Problem(ProblemKind::InvalidRequest))
+    }
+
     pub(crate) fn principal(
         &self,
         headers: &HeaderMap,
@@ -78,6 +96,13 @@ pub fn router(configuration: Configuration) -> Router {
         reads: configuration.reads,
     });
     Router::new()
+        .route(
+            &route::object_pattern(),
+            get(crate::object::get)
+                .head(crate::object::head)
+                .put(crate::object::put)
+                .delete(crate::object::remove),
+        )
         .route(
             &route::lease_request_pattern(),
             put(acquire).get(status).delete(cancel),

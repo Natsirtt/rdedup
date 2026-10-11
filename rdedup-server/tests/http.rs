@@ -297,3 +297,326 @@ async fn malformed_http_inputs_return_stable_problem_bodies() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn shared_uploads_are_atomic_and_destructive_requests_require_exclusive_protection(
+) {
+    let server = Server::start(false).await;
+    let token = "ab".repeat(32);
+    let request = LeaseRequestId::generate();
+    server
+        .acquire(request, LeaseMode::Shared, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    let lease = server.granted(request, Some(&token)).await;
+    let path = "0000000000000000-0000000000000000/name/archive.yml";
+    let url = format!("{}{}/{path}", server.address, route::OBJECTS);
+    let response = server
+        .client
+        .put(&url)
+        .bearer_auth(&token)
+        .header(route::LEASE_HEADER, lease.id.to_string())
+        .header("if-none-match", "*")
+        .body("published bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    problem(
+        server
+            .client
+            .put(&url)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .header("if-none-match", "*")
+            .body("different bytes")
+            .send()
+            .await
+            .unwrap(),
+        ProblemKind::AlreadyExists,
+    )
+    .await;
+    let metadata = server
+        .client
+        .head(&url)
+        .bearer_auth(&token)
+        .header(route::LEASE_HEADER, lease.id.to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let metadata: rdedup_lib::backends::Metadata = serde_json::from_str(
+        metadata.headers()[route::METADATA_HEADER].to_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata.len, 15);
+    let rejected = server.client.head(&url).send().await.unwrap();
+    assert_eq!(rejected.status(), ProblemKind::LeaseRequired.status());
+    let details: Problem = serde_json::from_str(
+        rejected.headers()[route::PROBLEM_HEADER].to_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(details.kind, ProblemKind::LeaseRequired);
+    assert!(rejected.bytes().await.unwrap().is_empty());
+    let response = server
+        .client
+        .get(&url)
+        .bearer_auth(&token)
+        .header(route::LEASE_HEADER, lease.id.to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), "published bytes");
+    problem(
+        server
+            .client
+            .put(&url)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .body("destructive replacement")
+            .send()
+            .await
+            .unwrap(),
+        ProblemKind::LeaseMode,
+    )
+    .await;
+    problem(
+        server
+            .client
+            .delete(&url)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, lease.id.to_string())
+            .send()
+            .await
+            .unwrap(),
+        ProblemKind::LeaseMode,
+    )
+    .await;
+    problem(
+        server.client.get(&url).send().await.unwrap(),
+        ProblemKind::LeaseRequired,
+    )
+    .await;
+    for path in [
+        ".lock",
+        "0000000000000000-0000000000000000/name/archive.random.tmp",
+    ] {
+        problem(
+            server
+                .client
+                .get(format!("{}{}/{path}", server.address, route::OBJECTS))
+                .header(route::LEASE_HEADER, lease.id.to_string())
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap(),
+            ProblemKind::InvalidRequest,
+        )
+        .await;
+    }
+    server
+        .client
+        .delete(format!("{}{}/{}", server.address, route::LEASES, lease.id))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let exclusive = LeaseRequestId::generate();
+    server
+        .acquire(exclusive, LeaseMode::Exclusive, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    let exclusive = server.granted(exclusive, Some(&token)).await;
+    assert_eq!(
+        server
+            .client
+            .put(&url)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, exclusive.id.to_string())
+            .body("replacement")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        server
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, exclusive.id.to_string())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "replacement"
+    );
+    assert_eq!(
+        server
+            .client
+            .delete(&url)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, exclusive.id.to_string())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    problem(
+        server
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .header(route::LEASE_HEADER, exclusive.id.to_string())
+            .send()
+            .await
+            .unwrap(),
+        ProblemKind::NotFound,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_stalled_upload_loses_its_lease_without_publishing_and_releases_storage(
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = Server::start(false).await;
+    let token = "ab".repeat(32);
+    let request = LeaseRequestId::generate();
+    server
+        .acquire(request, LeaseMode::Shared, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    let lease = server.granted(request, Some(&token)).await;
+    let path = "0000000000000000-0000000000000000/name/incomplete.yml";
+    let mut connection = tokio::net::TcpStream::connect(
+        server.address.strip_prefix("http://").unwrap(),
+    )
+    .await
+    .unwrap();
+    connection.write_all(format!("PUT {}/{path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n{}: {}\r\nIf-None-Match: *\r\nContent-Length: 100\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n", route::OBJECTS, route::LEASE_HEADER, lease.id).as_bytes()).await.unwrap();
+    let mut interim = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !interim.ends_with(b"\r\n\r\n") {
+            interim.push(connection.read_u8().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(String::from_utf8(interim)
+        .unwrap()
+        .starts_with("HTTP/1.1 100 Continue"));
+    connection.write_all(b"partial").await.unwrap();
+    server
+        .client
+        .delete(format!("{}{}/{}", server.address, route::LEASES, lease.id))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        connection.read_to_end(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 410 Gone"), "{response}");
+    assert!(response.contains("urn:rdedup:problem:lease-expired"));
+    assert!(!server
+        ._directory
+        .path()
+        .join("repository")
+        .join(path)
+        .exists());
+    let exclusive = LeaseRequestId::generate();
+    server
+        .acquire(exclusive, LeaseMode::Exclusive, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        server.granted(exclusive, Some(&token)).await.mode,
+        LeaseMode::Exclusive
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_download_releases_storage_on_lease_loss_without_client_reads(
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = Server::start(false).await;
+    let token = "ab".repeat(32);
+    let path = format!(
+        "0000000000000000-0000000000000000/chunk/{}",
+        "ab".repeat(32)
+    );
+    let native_path = server._directory.path().join("repository").join(&path);
+    std::fs::create_dir_all(native_path.parent().unwrap()).unwrap();
+    std::fs::File::create(native_path)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let request = LeaseRequestId::generate();
+    server
+        .acquire(request, LeaseMode::Shared, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    let lease = server.granted(request, Some(&token)).await;
+    let mut connection = tokio::net::TcpStream::connect(
+        server.address.strip_prefix("http://").unwrap(),
+    )
+    .await
+    .unwrap();
+    connection.write_all(format!("GET {}/{path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n{}: {}\r\n\r\n", route::OBJECTS, route::LEASE_HEADER, lease.id).as_bytes()).await.unwrap();
+    let mut headers = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(connection.read_u8().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(String::from_utf8(headers)
+        .unwrap()
+        .starts_with("HTTP/1.1 200 OK"));
+    server
+        .client
+        .delete(format!("{}{}/{}", server.address, route::LEASES, lease.id))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let exclusive = LeaseRequestId::generate();
+    server
+        .acquire(exclusive, LeaseMode::Exclusive, Some(&token))
+        .await
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        server.granted(exclusive, Some(&token)).await.mode,
+        LeaseMode::Exclusive
+    );
+    drop(connection);
+}

@@ -27,6 +27,12 @@ pub struct LeaseReader {
     validity: LeaseCheck,
 }
 
+impl LeaseReader {
+    pub(crate) fn lease_check(&self) -> LeaseCheck {
+        self.validity.clone()
+    }
+}
+
 impl Read for LeaseReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.validity.ensure_active().map_err(io::Error::other)?;
@@ -52,6 +58,10 @@ impl Write for LeaseWriter {
 }
 
 impl LeaseWriter {
+    pub(crate) fn lease_check(&self) -> LeaseCheck {
+        self.validity.clone()
+    }
+
     /// Publish a fully received object under its originating protection.
     ///
     /// # Errors

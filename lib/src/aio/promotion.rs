@@ -1,6 +1,8 @@
 //! Additive publication of an existing chunk in a later generation.
 use std::path::{Path, PathBuf};
 
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::chunk_path::ChunkPath;
@@ -24,7 +26,7 @@ pub enum Error {
 /// Promotion makes the destination available without removing the source.
 /// Shared readers can therefore continue using either generation. Exclusive GC
 /// removes the older entry when reclaiming that generation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ChunkPromotion {
     source: ChunkPath,
     destination: ChunkPath,
@@ -77,6 +79,63 @@ impl ChunkPromotion {
     }
 }
 
+impl<'de> Deserialize<'de> for ChunkPromotion {
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        struct PromotionVisitor;
+        impl<'de> Visitor<'de> for PromotionVisitor {
+            type Value = ChunkPromotion;
+            fn expecting(
+                &self,
+                formatter: &mut std::fmt::Formatter<'_>,
+            ) -> std::fmt::Result {
+                formatter.write_str("source and destination paths for a forward chunk promotion")
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut source = None;
+                let mut destination = None;
+                while let Some(field) = map.next_key::<String>()? {
+                    match field.as_str() {
+                        "source" => {
+                            if source.is_some() {
+                                return Err(de::Error::duplicate_field(
+                                    "source",
+                                ));
+                            }
+                            source = Some(map.next_value()?);
+                        }
+                        "destination" => {
+                            if destination.is_some() {
+                                return Err(de::Error::duplicate_field(
+                                    "destination",
+                                ));
+                            }
+                            destination = Some(map.next_value()?);
+                        }
+                        _ => {
+                            return Err(de::Error::unknown_field(
+                                &field,
+                                &["source", "destination"],
+                            ))
+                        }
+                    }
+                }
+                let source =
+                    source.ok_or_else(|| de::Error::missing_field("source"))?;
+                let destination = destination
+                    .ok_or_else(|| de::Error::missing_field("destination"))?;
+                ChunkPromotion::new(source, destination)
+                    .map_err(de::Error::custom)
+            }
+        }
+        deserializer.deserialize_map(PromotionVisitor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ChunkPromotion, Error};
@@ -88,6 +147,46 @@ mod tests {
             &digest[..2],
             digest
         ))
+    }
+
+    #[test]
+    fn wire_promotions_preserve_paths_and_reject_invalid_semantics() {
+        let promotion = ChunkPromotion::from_paths(
+            path(0, &"ab".repeat(32)),
+            path(1, &"ab".repeat(32)),
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&promotion).unwrap();
+        assert!(!encoded.contains('\\'));
+        let decoded: ChunkPromotion = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.source_path(), promotion.source_path());
+        assert_eq!(decoded.destination_path(), promotion.destination_path());
+        let source = format!(
+            "0000000000000000-0000000000000000/chunk/ab/{}",
+            "ab".repeat(32)
+        );
+        let destination = format!(
+            "0000000000000001-0000000000000000/chunk/ab/{}",
+            "ab".repeat(32)
+        );
+        for invalid in [
+            format!(r#"{{"source":"{destination}","destination":"{source}"}}"#),
+            format!(
+                r#"{{"source":"{source}","source":"{source}","destination":"{destination}"}}"#
+            ),
+            format!(
+                r#"{{"source":"{source}","destination":"{destination}","extra":true}}"#
+            ),
+            format!(
+                r#"{{"source":"{}","destination":"{destination}"}}"#,
+                source.replace("/chunk/", "//chunk/")
+            ),
+        ] {
+            assert!(
+                serde_json::from_str::<ChunkPromotion>(&invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]

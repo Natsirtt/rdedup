@@ -1,4 +1,5 @@
 //! Validated locations of content-addressed chunks in the repository layout.
+use serde::{Deserialize, Serialize, Serializer};
 use std::path::{Component, Path, PathBuf};
 
 use crate::{config, Digest, Generation, DIGEST_SIZE};
@@ -18,13 +19,49 @@ pub enum Error {
 ///
 /// Parsing uses the same nesting encoder that constructs repository paths.
 /// Backend operations do not need to know digest widths or directory spelling.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "String")]
 pub struct ChunkPath {
     path: PathBuf,
     generation: Generation,
 }
 
+impl Serialize for ChunkPath {
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.portable())
+    }
+}
+
+impl TryFrom<String> for ChunkPath {
+    type Error = Error;
+    fn try_from(encoded: String) -> Result<Self, Error> {
+        let path = Self::new(PathBuf::from(&encoded))?;
+        if path.portable() != encoded {
+            return Err(Error::InvalidLocation {
+                path: encoded.into(),
+            });
+        }
+        Ok(path)
+    }
+}
+
 impl ChunkPath {
+    fn portable(&self) -> String {
+        self.path
+            .components()
+            .map(|part| {
+                // Construction validates generation, namespace and digest components.
+                part.as_os_str().to_str().expect(
+                    "ChunkPath contains only validated UTF-8 components",
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
     /// Validate a canonical native repository-relative chunk path.
     ///
     /// # Errors
@@ -81,6 +118,38 @@ impl ChunkPath {
     pub fn is_before(&self, other: &Self) -> bool {
         self.generation < other.generation
     }
+}
+
+/// Admit a generation's chunk root or a canonical sequence of nesting prefixes.
+pub(crate) fn validate_directory(path: &Path) -> Result<(), Error> {
+    let invalid = || Error::InvalidLocation {
+        path: path.to_owned(),
+    };
+    let parts = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => part.to_str().ok_or_else(invalid),
+            _ => Err(invalid()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let [generation, namespace, prefixes @ ..] = parts.as_slice() else {
+        return Err(invalid());
+    };
+    let parsed = Generation::try_from(generation).map_err(|_| invalid())?;
+    if parsed.to_string() != *generation
+        || *namespace != config::DATA_SUBDIR
+        || prefixes.len() >= DIGEST_SIZE
+    {
+        return Err(invalid());
+    }
+    for prefix in prefixes {
+        let mut byte = [0];
+        hex::decode_to_slice(prefix, &mut byte).map_err(Error::Digest)?;
+        if hex::encode(byte) != *prefix {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -3,6 +3,8 @@
 pub const OBJECTS: &str = "/api/v1/objects";
 /// Directory listing and exclusive removal endpoint.
 pub const DIRECTORIES: &str = "/api/v1/directories";
+/// Content type for newline-delimited `ListingRecord` values.
+pub const LISTING_CONTENT_TYPE: &str = "application/x-ndjson";
 /// General exclusive rename endpoint.
 pub const RENAMES: &str = "/api/v1/renames";
 /// Additive chunk promotion endpoint.
@@ -13,6 +15,8 @@ pub const LEASE_REQUESTS: &str = "/api/v1/lease-requests";
 pub const LEASES: &str = "/api/v1/leases";
 /// Header carrying the operation's lease identity.
 pub const LEASE_HEADER: &str = "x-rdedup-lease";
+/// Serialized problem details, including on HEAD responses without a body.
+pub const PROBLEM_HEADER: &str = "x-rdedup-problem";
 /// Header carrying object metadata in a HEAD response.
 pub const METADATA_HEADER: &str = "x-rdedup-object-metadata";
 

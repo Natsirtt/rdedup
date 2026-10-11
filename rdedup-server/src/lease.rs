@@ -11,7 +11,9 @@ pub use coordinator::{
     Error, ExclusivePermit, LeaseCheck, LeaseService, Principal, SharedPermit,
 };
 pub use identity::{CredentialName, Error as CredentialNameError};
-pub use object::{Error as ObjectError, LeaseReader, LeaseWriter};
+pub use object::{
+    Error as ObjectError, LeaseEntries, LeaseReader, LeaseWriter,
+};
 pub use request::{
     Error as RequestPolicyError, RequestCapacity, RequestPolicy,
 };

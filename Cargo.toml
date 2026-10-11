@@ -51,7 +51,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 http = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+axum = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+toml = "0.8"
+subtle = "2"
+hex = "0.4"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 fs2 = "0.4"
 tempfile = "3"
 
@@ -59,7 +65,7 @@ tempfile = "3"
 # Default features disabled so they can be explicitly opted into
 rdedup-lib = { version = "3.2.0", path = "lib", default-features = false }
 clap = { version = "3.1.0", features = [ "derive" ] }
-hex = "0.4.2"
+hex = { workspace = true }
 rpassword = "7.0"
 slog = { version = "2.0.10", features = ["max_level_trace", "release_max_level_trace"]}
 slog-term = "2"

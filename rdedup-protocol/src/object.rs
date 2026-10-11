@@ -171,6 +171,28 @@ pub struct DirectoryQuery {
     pub scope: ListScope,
 }
 
+/// One newline-delimited record in a streamed directory listing.
+///
+/// A consumer must observe `Complete` before accepting a successful scan.
+/// End-of-body without a terminal record is an incomplete listing, even when
+/// the HTTP connection otherwise appears to have closed cleanly.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ListingRecord {
+    /// An admitted repository-relative entry.
+    Entry {
+        /// Location of a published object or directory.
+        path: RepositoryPath,
+    },
+    /// Every entry was enumerated successfully under the originating lease.
+    Complete,
+    /// Enumeration failed; preceding entries do not constitute a complete scan.
+    Failed {
+        /// Stable reason the caller cannot accept this listing as complete.
+        problem: crate::problem::Problem,
+    },
+}
+
 /// Exclusive relocation of an arbitrary admitted repository object.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -184,6 +206,27 @@ pub struct Rename {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn listing_records_distinguish_completion_from_protection_loss() {
+        let complete = serde_json::to_string(&ListingRecord::Complete).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ListingRecord>(&complete).unwrap(),
+            ListingRecord::Complete
+        ));
+        let failed = ListingRecord::Failed {
+            problem: crate::problem::Problem {
+                kind: crate::problem::ProblemKind::LeaseExpired,
+                detail: "lease expired".to_owned(),
+            },
+        };
+        let encoded = serde_json::to_string(&failed).unwrap();
+        let ListingRecord::Failed { problem } =
+            serde_json::from_str(&encoded).unwrap()
+        else {
+            panic!("listing failure must remain a failure");
+        };
+        assert_eq!(problem.kind, crate::problem::ProblemKind::LeaseExpired);
+    }
     #[test]
     fn traversal_and_platform_aliases_are_rejected_at_deserialization() {
         for invalid in [

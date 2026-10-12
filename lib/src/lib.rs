@@ -53,6 +53,7 @@ use self::name::*;
 
 mod chunk_path;
 mod misc;
+pub mod publication;
 mod repository_path;
 use self::misc::*;
 // }}}
@@ -65,6 +66,7 @@ pub mod backends {
         OperationState, Shared,
     };
     pub use crate::aio::promotion::{ChunkPromotion, Error as PromotionError};
+    pub use crate::aio::protection::Error as ProtectionError;
     pub use crate::aio::Metadata;
     pub use crate::chunk_path::{ChunkPath, Error as ChunkPathError};
     pub use crate::repository_path::{
@@ -858,6 +860,16 @@ impl Repo {
     {
         info!(self.log, "Writing data"; "name" => name_str);
         let operation = self.backend.begin_shared()?;
+        self.write_attempt(name_str, reader, enc, operation)
+    }
+
+    fn write_attempt<R: Read + Send>(
+        &self,
+        name_str: &str,
+        reader: R,
+        enc: &EncryptHandle,
+        operation: backends::BackendOperation<backends::Shared>,
+    ) -> Result<WriteStats> {
         let aio = aio::AsyncIO::new(operation.clone(), self.log.clone())?;
 
         let mut generations = self.read_generations(&aio)?;

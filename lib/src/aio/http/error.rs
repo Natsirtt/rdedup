@@ -46,6 +46,17 @@ impl Error {
 }
 impl From<Error> for io::Error {
     fn from(error: Error) -> Self {
+        if matches!(
+            error,
+            Error::Problem(
+                ProblemKind::LeaseExpired | ProblemKind::RenewalClosed
+            ) | Error::CoordinatorStopped
+        ) {
+            return crate::backends::ProtectionError::Lost {
+                source: Box::new(error),
+            }
+            .into();
+        }
         let kind = match &error {
             Error::RepositoryUrl | Error::Credential => {
                 io::ErrorKind::InvalidInput

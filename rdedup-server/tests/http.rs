@@ -1,5 +1,7 @@
 #[path = "support/lost_response.rs"]
 mod lost_response;
+#[path = "support/paused_input.rs"]
+mod paused_input;
 use rdedup_protocol::lease::{
     AcquireLease, Acquisition, LeaseGrant, LeaseMode, LeaseRequestId,
 };
@@ -1158,4 +1160,136 @@ async fn client_recovers_a_committed_upload_after_losing_its_response() {
         proxy.events.recv().await.unwrap(),
         lost_response::Event::RetriedWrite
     );
+}
+
+#[tokio::test]
+async fn repository_replays_after_exclusive_handoff_and_reuses_chunks() {
+    use rdedup_lib::backends::http::Http;
+    use rdedup_lib::publication::WriteRetryPolicy;
+    use rdedup_lib::{settings, Repo};
+    use std::io::Cursor;
+    use std::sync::{mpsc, Arc};
+
+    let server = Server::with_timing(false, 2, 2).await;
+    let address = server.address.clone();
+    let (reached, paused) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = mpsc::channel();
+    let publication = tokio::task::spawn_blocking(move || {
+        let mut settings = settings::Repo::new();
+        settings
+            .set_compression(settings::Compression::None)
+            .unwrap();
+        settings.use_fastcdc_chunking(Some(14)).unwrap();
+        let repository = Repo::init(
+            Arc::new(move || {
+                Ok(Box::new(
+                    Http::new(
+                        address.parse().unwrap(),
+                        Some("ab".repeat(32).parse().unwrap()),
+                    )
+                    .unwrap(),
+                ))
+            }),
+            &|| Ok(String::new()),
+            settings,
+            None,
+        )
+        .unwrap();
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(String::new())).unwrap();
+        let decryption =
+            repository.unlock_decrypt(&|| Ok(String::new())).unwrap();
+        let mut seed = 57_u64;
+        let bytes: Arc<[u8]> = (0..2 * 1024 * 1024)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let mut pause = Some(paused_input::Pause::new(reached, resumed));
+        let mut attempts = 0;
+        let mut source = || {
+            attempts += 1;
+            Ok(paused_input::Input::new(Arc::clone(&bytes), pause.take()))
+        };
+        repository
+            .write_replayable(
+                "archive",
+                &mut source,
+                &encryption,
+                WriteRetryPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(attempts, 2, "lease loss must restart the complete source");
+        let mut restored = Vec::new();
+        repository
+            .read("archive", &mut restored, &decryption)
+            .unwrap();
+        assert_eq!(restored, bytes.as_ref());
+        let duplicate = repository
+            .write("second", Cursor::new(Arc::clone(&bytes)), &encryption)
+            .unwrap();
+        assert_eq!(
+            duplicate.new_chunks, 0,
+            "existing chunks must not be uploaded again"
+        );
+        repository
+            .write("archive", Cursor::new(Arc::clone(&bytes)), &encryption)
+            .unwrap();
+        let conflict = repository
+            .write("archive", Cursor::new(b"different"), &encryption)
+            .unwrap_err();
+        assert_eq!(conflict.kind(), std::io::ErrorKind::AlreadyExists);
+        repository.gc(0).unwrap();
+        restored.clear();
+        repository
+            .read("archive", &mut restored, &decryption)
+            .unwrap();
+        assert_eq!(restored, bytes.as_ref());
+        repository.rm("archive").unwrap();
+        repository.rm("second").unwrap();
+        repository.gc(0).unwrap();
+        assert!(repository.list_names().unwrap().is_empty());
+    });
+    tokio::time::timeout(Duration::from_secs(15), paused)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = "cd".repeat(32);
+    let request = LeaseRequestId::generate();
+    let response = server
+        .acquire(request, LeaseMode::Exclusive, Some(&token))
+        .await;
+    assert!(matches!(
+        response.json::<Acquisition>().await.unwrap(),
+        Acquisition::Queued
+    ));
+    let exclusive = server.granted(request, Some(&token)).await;
+    assert!(!server
+        ._directory
+        .path()
+        .join("repository/0000000000000000-0000000000000000/name/archive.yml")
+        .exists());
+    server
+        .client
+        .delete(format!(
+            "{}{}/{}",
+            server.address,
+            route::LEASES,
+            exclusive.id
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    resume.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), publication)
+        .await
+        .unwrap()
+        .unwrap();
 }

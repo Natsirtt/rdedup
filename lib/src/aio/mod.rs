@@ -29,6 +29,7 @@ pub(crate) use self::b2::B2;
 
 pub(crate) mod backend;
 pub(crate) mod promotion;
+pub(crate) mod protection;
 use promotion::ChunkPromotion;
 pub(crate) mod local_cache;
 

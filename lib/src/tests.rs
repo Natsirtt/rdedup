@@ -684,6 +684,10 @@ mod write_failures {
 
     #[derive(Clone, Copy)]
     enum Failure {
+        None,
+        ProtectionUpload,
+        FirstProtectionUpload,
+        InterruptedUpload,
         Upload,
         Metadata,
         Promotion,
@@ -693,6 +697,7 @@ mod write_failures {
     struct FailingBackend {
         path: PathBuf,
         failure: Failure,
+        attempts: std::sync::atomic::AtomicUsize,
     }
     struct FailingOperation {
         local: BackendOperation<Shared>,
@@ -705,9 +710,27 @@ mod write_failures {
 
     impl Backend for FailingBackend {
         fn begin_shared(&self) -> io::Result<BackendOperation<Shared>> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let failure =
+                if matches!(self.failure, Failure::FirstProtectionUpload) {
+                    if attempt == 0 {
+                        Failure::ProtectionUpload
+                    } else {
+                        // A fresh attempt cannot overlap protection retained by old workers.
+                        drop(
+                            Local::new(self.path.clone())
+                                .try_exclusive_operation()?,
+                        );
+                        Failure::None
+                    }
+                } else {
+                    self.failure
+                };
             Ok(BackendOperation::new(FailingOperation {
                 local: Local::new(self.path.clone()).begin_shared()?,
-                failure: self.failure,
+                failure,
             }))
         }
         fn begin_exclusive(&self) -> io::Result<BackendOperation<Exclusive>> {
@@ -743,6 +766,19 @@ mod write_failures {
             idempotent: bool,
         ) -> io::Result<()> {
             assert!(idempotent);
+            if matches!(self.failure, Failure::ProtectionUpload)
+                && is_chunk(&path)
+            {
+                return Err(crate::backends::ProtectionError::Lost {
+                    source: Box::new(injected()),
+                }
+                .into());
+            }
+            if matches!(self.failure, Failure::InterruptedUpload)
+                && is_chunk(&path)
+            {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
             if matches!(self.failure, Failure::Upload) && is_chunk(&path) {
                 return Err(injected());
             }
@@ -793,7 +829,11 @@ mod write_failures {
         }
     }
     fn inject(repository: &mut lib::Repo, path: PathBuf, failure: Failure) {
-        repository.backend = Arc::new(FailingBackend { path, failure });
+        repository.backend = Arc::new(FailingBackend {
+            path,
+            failure,
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
     }
 
     #[test]
@@ -886,6 +926,157 @@ mod write_failures {
         let error = repository.write("failed", input, &encryption).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(repository.list_names().unwrap().is_empty());
+        wipe(&repository);
+    }
+    #[test]
+    fn replay_reopens_the_complete_source_after_old_workers_release_protection()
+    {
+        let (mut repository, directory) = test_repo_dir(PASS);
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+        inject(
+            &mut repository,
+            directory.clone(),
+            Failure::FirstProtectionUpload,
+        );
+        let mut opened = 0;
+        let mut source = || {
+            opened += 1;
+            assert!(!walkdir::WalkDir::new(&directory)
+                .into_iter()
+                .map(|entry| entry.unwrap())
+                .any(|entry| entry.file_name() == "replayed.yml"));
+            Ok(io::Cursor::new(b"the entire archive, from its beginning"))
+        };
+        repository
+            .write_replayable(
+                "replayed",
+                &mut source,
+                &encryption,
+                crate::publication::WriteRetryPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(opened, 2);
+        let decryption =
+            repository.unlock_decrypt(&|| Ok(PASS.into())).unwrap();
+        let mut restored = Vec::new();
+        repository
+            .read("replayed", &mut restored, &decryption)
+            .unwrap();
+        assert_eq!(restored, b"the entire archive, from its beginning");
+        drop(repository);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replay_is_bounded_and_does_not_retry_ordinary_io_failures() {
+        for failure in [
+            Failure::ProtectionUpload,
+            Failure::InterruptedUpload,
+            Failure::Upload,
+        ] {
+            let (mut repository, directory) = test_repo_dir(PASS);
+            let encryption =
+                repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+            inject(&mut repository, directory.clone(), failure);
+            let mut opened = 0;
+            let mut source = || {
+                opened += 1;
+                Ok(io::Cursor::new(b"archive"))
+            };
+            let error = repository
+                .write_replayable(
+                    "failed",
+                    &mut source,
+                    &encryption,
+                    crate::publication::WriteRetryPolicy::default(),
+                )
+                .unwrap_err();
+            let lost = matches!(failure, Failure::ProtectionUpload);
+            assert_eq!(opened, if lost { 3 } else { 1 });
+            assert_eq!(
+                crate::backends::ProtectionError::find_in(&error).is_some(),
+                lost
+            );
+            assert!(repository.list_names().unwrap().is_empty());
+            drop(repository);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn replay_does_not_open_the_source_without_acquired_protection() {
+        let (mut repository, directory) = test_repo_dir(PASS);
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+        repository.backend = Arc::new(super::FailingLockBackend);
+        let mut source = || -> io::Result<io::Cursor<Vec<u8>>> {
+            panic!("source must not open without protection")
+        };
+        let error = repository
+            .write_replayable(
+                "failed",
+                &mut source,
+                &encryption,
+                crate::publication::WriteRetryPolicy::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        drop(repository);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn replay_returns_source_failures_and_name_conflicts_without_reopening() {
+        let repository = test_repo(PASS);
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(PASS.into())).unwrap();
+        let mut opened = 0;
+        let mut unavailable = || -> io::Result<io::Cursor<Vec<u8>>> {
+            opened += 1;
+            Err(injected())
+        };
+        assert_eq!(
+            repository
+                .write_replayable(
+                    "failed",
+                    &mut unavailable,
+                    &encryption,
+                    crate::publication::WriteRetryPolicy::default()
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(opened, 1);
+        assert!(repository.list_names().unwrap().is_empty());
+        repository
+            .write("existing", io::Cursor::new(b"original"), &encryption)
+            .unwrap();
+        let mut reopened = 0;
+        let mut different = || {
+            reopened += 1;
+            Ok(io::Cursor::new(b"different"))
+        };
+        assert_eq!(
+            repository
+                .write_replayable(
+                    "existing",
+                    &mut different,
+                    &encryption,
+                    crate::publication::WriteRetryPolicy::default()
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(reopened, 1);
+        let decryption =
+            repository.unlock_decrypt(&|| Ok(PASS.into())).unwrap();
+        let mut contents = Vec::new();
+        repository
+            .read("existing", &mut contents, &decryption)
+            .unwrap();
+        assert_eq!(contents, b"original");
         wipe(&repository);
     }
 }

@@ -937,6 +937,8 @@ async fn backend_traits_round_trip_objects_and_retain_worker_protection() {
         let backend = Http::new(address.parse().unwrap(), Some(token)).unwrap();
         let operation = backend.begin_shared().unwrap();
         let mut worker = operation.new_thread().unwrap();
+        assert!(worker.list(".".into()).unwrap().is_empty());
+        assert!(worker.list(std::path::PathBuf::new()).unwrap().is_empty());
         drop(operation);
         worker
             .create(

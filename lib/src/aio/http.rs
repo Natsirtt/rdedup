@@ -123,7 +123,9 @@ impl HttpThread {
         scope: ListScope,
         mut entry: impl FnMut(PathBuf) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let path = if path.as_os_str().is_empty() {
+        let path = if path.as_os_str().is_empty()
+            || path == std::path::Path::new(".")
+        {
             None
         } else {
             Some(Self::path(&path)?)

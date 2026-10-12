@@ -1,3 +1,5 @@
+#[path = "support/lost_response.rs"]
+mod lost_response;
 use rdedup_protocol::lease::{
     AcquireLease, Acquisition, LeaseGrant, LeaseMode, LeaseRequestId,
 };
@@ -1113,3 +1115,45 @@ async fn client_renews_active_work_then_stops_at_an_exclusive_cutoff() {
         .exists());
 }
 
+#[tokio::test]
+async fn client_recovers_a_committed_upload_after_losing_its_response() {
+    use rdedup_lib::backends::{http::Http, Backend};
+    let server = Server::start(false).await;
+    let mut proxy = lost_response::Proxy::start(
+        server.address.trim_start_matches("http://").to_owned(),
+    )
+    .await;
+    let address = proxy.address.clone();
+    tokio::task::spawn_blocking(move || {
+        let backend = Http::new(
+            address.parse().unwrap(),
+            Some("ab".repeat(32).parse().unwrap()),
+        )
+        .unwrap();
+        let operation = backend.begin_shared().unwrap();
+        let mut worker = operation.new_thread().unwrap();
+        worker
+            .create(
+                "config.yml".into(),
+                sgdata::SGData::from_many(vec![
+                    b"first".to_vec(),
+                    b"second".to_vec(),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            worker.read("config.yml".into()).unwrap().into_linear_vec(),
+            b"firstsecond"
+        );
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        proxy.events.recv().await.unwrap(),
+        lost_response::Event::CommittedWithoutResponse
+    );
+    assert_eq!(
+        proxy.events.recv().await.unwrap(),
+        lost_response::Event::RetriedWrite
+    );
+}

@@ -35,7 +35,10 @@ impl Error {
         match self {
             Self::Problem(kind) => kind.is_transient(),
             Self::Request(error) => {
-                error.is_connect() || error.is_timeout() || error.is_body()
+                error.is_connect()
+                    || error.is_timeout()
+                    || error.is_body()
+                    || error.is_request()
             }
             _ => false,
         }

@@ -1,296 +1,334 @@
-use crate::aio::Metadata;
+//! Writable HTTP backend with operation-owned server leases.
+mod error;
+mod lease;
+mod stream;
+mod timing;
+mod transport;
+
+use super::Metadata;
 use crate::backends::{
-    Backend, BackendOperation, BackendThread, Exclusive, Shared,
+    Backend, BackendOperation, BackendThread, ChunkPromotion, Exclusive,
+    OperationState, Shared,
 };
-use reqwest::blocking::Client;
-use serde::Deserialize;
+pub use error::Error;
+use lease::Lease;
+pub use rdedup_protocol::credential::BearerToken;
+use rdedup_protocol::lease::LeaseMode;
+use rdedup_protocol::object::{
+    DirectoryQuery, ListScope, Rename, RepositoryPath,
+};
+use rdedup_protocol::problem::ProblemKind;
+use rdedup_protocol::route;
+use reqwest::blocking::Body;
+use reqwest::Method;
 use sgdata::SGData;
+use std::io::{self, BufReader, Read};
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
-use std::{io, mem};
+use std::sync::{mpsc::Sender, Arc};
+use transport::{Retry, Transport};
 use url::Url;
 
-#[derive(Deserialize)]
-struct FileInfo {
-    name: String,
-    mtime: String,
-    size: Option<u64>,
-    #[serde(rename = "type")]
-    file_type: String,
+/// A connection pool and optional credential for one HTTP repository.
+/// Each repository operation acquires and owns its own server lease.
+pub struct Http {
+    transport: Transport,
 }
-
-pub struct HttpReadOnly;
-
-impl HttpReadOnly {
-    pub fn new(_base_url: Url) -> Self {
-        HttpReadOnly
-    }
-}
-
-pub struct HttpReadOnlyThread {
-    base_url: Url,
-    client: Client,
-}
-
-impl HttpReadOnlyThread {
-    fn get_endpoint(&self, path: PathBuf) -> Result<Url, io::Error> {
-        self.base_url.join(path.to_str().unwrap()).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to build endpoint: {}", e),
-            )
+impl Http {
+    /// Configure an HTTP repository, optionally through a TLS reverse proxy.
+    ///
+    /// # Errors
+    /// Rejects non-HTTP URLs, embedded credentials, query strings and fragments,
+    /// or failure to construct the HTTP connection pool.
+    pub fn new(url: Url, token: Option<BearerToken>) -> Result<Self, Error> {
+        Ok(Self {
+            transport: Transport::new(url, token)?,
         })
     }
-
-    fn get_blocking(
+    pub(crate) fn from_environment(url: Url) -> Result<Self, Error> {
+        let token = match std::env::var("RDEDUP_HTTP_TOKEN") {
+            Ok(value) => Some(value.parse().map_err(|_| Error::Credential)?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err(Error::Credential),
+        };
+        Self::new(url, token)
+    }
+    fn operation<Access>(
+        &self,
+        mode: LeaseMode,
+    ) -> io::Result<BackendOperation<Access>> {
+        let lease = Arc::new(
+            Lease::acquire(self.transport.clone(), mode)
+                .map_err(io::Error::from)?,
+        );
+        Ok(BackendOperation::new(Operation {
+            transport: self.transport.clone(),
+            lease,
+        }))
+    }
+}
+impl Backend for Http {
+    fn begin_shared(&self) -> io::Result<BackendOperation<Shared>> {
+        self.operation(LeaseMode::Shared)
+    }
+    fn begin_exclusive(&self) -> io::Result<BackendOperation<Exclusive>> {
+        self.operation(LeaseMode::Exclusive)
+    }
+}
+struct Operation {
+    transport: Transport,
+    lease: Arc<Lease>,
+}
+impl OperationState for Operation {
+    fn new_thread(&self) -> io::Result<Box<dyn BackendThread>> {
+        self.lease.check().map_err(io::Error::from)?;
+        Ok(Box::new(HttpThread {
+            transport: self.transport.clone(),
+            lease: Arc::clone(&self.lease),
+        }))
+    }
+}
+/// A worker retaining the exact lease that admitted its repository operation.
+/// Workers can only be constructed through a protected backend operation.
+pub struct HttpThread {
+    transport: Transport,
+    lease: Arc<Lease>,
+}
+impl HttpThread {
+    fn path(path: &std::path::Path) -> Result<RepositoryPath, Error> {
+        RepositoryPath::from_path(path).map_err(|_| Error::Protocol)
+    }
+    fn execute(
+        &self,
+        method: Method,
+        route: &str,
+        suffix: Option<&str>,
+        retry: Retry,
+        mut configure: impl FnMut(
+            reqwest::blocking::RequestBuilder,
+        ) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<reqwest::blocking::Response, Error> {
+        let url = self.transport.endpoint(route, suffix)?;
+        self.transport.execute(retry, || {
+            self.lease.check()?;
+            let request = self
+                .transport
+                .request(method.clone(), url.clone())
+                .header(route::LEASE_HEADER, self.lease.id().to_string());
+            Ok(configure(request))
+        })
+    }
+    fn enumerate(
         &self,
         path: PathBuf,
-    ) -> io::Result<reqwest::blocking::Response> {
-        self.client
-            .get(self.get_endpoint(path)?)
-            .send()
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    format!("Request failed: {:?}", e),
-                )
-            })
+        scope: ListScope,
+        mut entry: impl FnMut(PathBuf) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let path = if path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(Self::path(&path)?)
+        };
+        let query = DirectoryQuery { path, scope };
+        let response = self.execute(
+            Method::GET,
+            route::DIRECTORIES,
+            None,
+            Retry::Idempotent,
+            |request| request.query(&query),
+        )?;
+        stream::listing(BufReader::new(response), |path| {
+            self.lease.check()?;
+            entry(path)
+        })?;
+        self.lease.check()
+    }
+    fn delete(
+        &self,
+        route: &str,
+        suffix: Option<&str>,
+        query: Option<DirectoryQuery>,
+    ) -> Result<(), Error> {
+        match self.execute(
+            Method::DELETE,
+            route,
+            suffix,
+            Retry::Idempotent,
+            |request| {
+                if let Some(query) = &query {
+                    request.query(query)
+                } else {
+                    request
+                }
+            },
+        ) {
+            Ok(_) | Err(Error::Problem(ProblemKind::NotFound)) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
-
-impl Backend for HttpReadOnly {
-    fn begin_exclusive(&self) -> io::Result<BackendOperation<Exclusive>> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "static HTTP servers cannot provide repository protection",
-        ))
+impl BackendThread for HttpThread {
+    fn promote_chunk(&mut self, promotion: ChunkPromotion) -> io::Result<()> {
+        self.execute(
+            Method::POST,
+            route::PROMOTIONS,
+            None,
+            Retry::Idempotent,
+            |request| request.json(&promotion),
+        )
+        .map(|_| ())
+        .map_err(Into::into)
     }
-
-    fn begin_shared(&self) -> io::Result<BackendOperation<Shared>> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "static HTTP servers cannot provide repository protection; use a lease-aware rdedup server"))
+    fn remove_dir_all(&mut self, path: PathBuf) -> io::Result<()> {
+        let query = DirectoryQuery {
+            path: Some(Self::path(&path).map_err(io::Error::from)?),
+            scope: ListScope::Recursive,
+        };
+        self.delete(route::DIRECTORIES, None, Some(query))
+            .map_err(Into::into)
     }
-}
-
-fn get_content_type(
-    response: &reqwest::blocking::Response,
-) -> io::Result<&reqwest::header::HeaderValue> {
-    response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .ok_or(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "No content type header",
-        ))
-}
-
-fn is_file_content_type(header: &reqwest::header::HeaderValue) -> bool {
-    header == "application/octet-stream" || header == "text/x-yaml"
-}
-
-fn is_directory_content_type(header: &reqwest::header::HeaderValue) -> bool {
-    header == "application/json"
-}
-
-impl BackendThread for HttpReadOnlyThread {
-    fn promote_chunk(
-        &mut self,
-        _promotion: super::promotion::ChunkPromotion,
-    ) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "backend does not support protected chunk promotion",
-        ))
-    }
-
-    fn remove_dir_all(&mut self, _path: PathBuf) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::ReadOnlyFilesystem,
-            "Static HTTP endpoint is read-only",
-        ))
-    }
-
     fn rename(
         &mut self,
-        _src_path: PathBuf,
-        _dst_path: PathBuf,
+        source: PathBuf,
+        destination: PathBuf,
     ) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::ReadOnlyFilesystem,
-            "Static HTTP endpoint is read-only",
-        ))
+        let rename = Rename {
+            source: Self::path(&source).map_err(io::Error::from)?,
+            destination: Self::path(&destination).map_err(io::Error::from)?,
+        };
+        self.execute(
+            Method::POST,
+            route::RENAMES,
+            None,
+            Retry::Never,
+            |request| request.json(&rename),
+        )
+        .map(|_| ())
+        .map_err(Into::into)
     }
-
     fn write(
         &mut self,
-        _path: PathBuf,
-        _sg: SGData,
-        _idempotent: bool,
+        path: PathBuf,
+        contents: SGData,
+        idempotent: bool,
     ) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::ReadOnlyFilesystem,
-            "Static HTTP endpoint is read-only",
-        ))
+        let path = Self::path(&path).map_err(io::Error::from)?;
+        let result = self.execute(
+            Method::PUT,
+            route::OBJECTS,
+            Some(path.as_str()),
+            Retry::Idempotent,
+            |request| {
+                let request = if idempotent {
+                    request.header(reqwest::header::IF_NONE_MATCH, "*")
+                } else {
+                    request
+                };
+                request.body(Body::sized(
+                    stream::Upload::new(
+                        contents.clone(),
+                        Arc::clone(&self.lease),
+                    ),
+                    contents.len() as u64,
+                ))
+            },
+        );
+        match result {
+            Ok(_) => self.lease.check().map_err(Into::into),
+            // Atomic creation preserves the existing object. Name publication
+            // reads it back and compares logical identity, just as with local storage.
+            Err(Error::Problem(ProblemKind::AlreadyExists)) if idempotent => {
+                self.lease.check().map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
-
     fn read(&mut self, path: PathBuf) -> io::Result<SGData> {
-        let response = self.get_blocking(path)?;
-        let content_type = get_content_type(&response)?;
-        if !is_file_content_type(content_type) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid content type {}",
-                    content_type.to_str().unwrap()
-                ),
-            ));
-        }
-
-        let data = response.bytes().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                format!("Failed to read response as bytes: {}", e),
+        let path = Self::path(&path).map_err(io::Error::from)?;
+        let mut response = self
+            .execute(
+                Method::GET,
+                route::OBJECTS,
+                Some(path.as_str()),
+                Retry::Idempotent,
+                |request| request,
             )
-        })?;
-
-        Ok(SGData::from_single(data.into()))
+            .map_err(io::Error::from)?;
+        let expected = response
+            .content_length()
+            .ok_or_else(|| io::Error::from(Error::Protocol))?;
+        let mut contents = SGData::empty();
+        loop {
+            self.lease.check().map_err(io::Error::from)?;
+            let mut bytes = vec![0; 128 * 1024];
+            let length = response.read(&mut bytes)?;
+            if length == 0 {
+                break;
+            }
+            bytes.truncate(length);
+            contents.push_vec(bytes);
+        }
+        self.lease.check().map_err(io::Error::from)?;
+        if contents.len() as u64 != expected {
+            return Err(Error::Protocol.into());
+        }
+        Ok(contents)
     }
-
-    fn remove(&mut self, _path: PathBuf) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::ReadOnlyFilesystem,
-            "Static HTTP endpoint is read-only",
-        ))
+    fn remove(&mut self, path: PathBuf) -> io::Result<()> {
+        let path = Self::path(&path).map_err(io::Error::from)?;
+        self.delete(route::OBJECTS, Some(path.as_str()), None)
+            .map_err(Into::into)
     }
-
     fn read_metadata(&mut self, path: PathBuf) -> io::Result<Metadata> {
-        let as_path = path.as_path();
-        let filename =
-            as_path.file_name().unwrap().to_str().unwrap().to_string();
-        let response =
-            self.get_blocking(PathBuf::from(as_path.parent().unwrap()))?;
-        let content_type = get_content_type(&response)?;
-
-        if !is_directory_content_type(content_type) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid content type '{:?}'",
-                    content_type.to_str().unwrap()
-                ),
-            ));
-        }
-
-        let file_list: Vec<FileInfo> = response.json().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse response as JSON: {:?}", e),
+        let path = Self::path(&path).map_err(io::Error::from)?;
+        let response = self
+            .execute(
+                Method::HEAD,
+                route::OBJECTS,
+                Some(path.as_str()),
+                Retry::Idempotent,
+                |request| request,
             )
-        })?;
-        let file: &FileInfo = file_list
-            .iter()
-            .find(|f| f.name == filename)
-            .ok_or(io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
-        if !file.file_type.eq("file") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} is not a file", filename),
-            ));
-        }
-        let m_datetime = chrono::DateTime::parse_from_rfc3339(
-            file.mtime.as_str(),
-        )
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse mtime to a datetime: {:?}", e),
-            )
-        })?;
-        Ok(Metadata {
-            len: file
-                .size
-                .expect("This is a file, so it should have a size."),
-            is_file: true,
-            created: m_datetime.into(),
-        })
+            .map_err(io::Error::from)?;
+        self.lease.check().map_err(io::Error::from)?;
+        let header = response
+            .headers()
+            .get(route::METADATA_HEADER)
+            .ok_or_else(|| io::Error::from(Error::Protocol))?;
+        serde_json::from_slice(header.as_bytes())
+            .map_err(|_| Error::Protocol.into())
     }
-
     fn list(&mut self, path: PathBuf) -> io::Result<Vec<PathBuf>> {
-        let response = self.get_blocking(path.clone())?;
-        if !response.status().is_success() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Bad response code: {}", response.status()),
-            ));
-        }
-        let content_type = get_content_type(&response)?;
-        if !is_directory_content_type(content_type) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid content type {}",
-                    content_type.to_str().unwrap()
-                ),
-            ));
-        }
-        let file_list: Vec<FileInfo> = response.json().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse response as JSON: {:?}", e),
-            )
-        })?;
-        let mut result = Vec::with_capacity(128);
-        for file in file_list {
-            result.push(path.join(file.name));
-        }
-        Ok(result)
+        let mut paths = Vec::new();
+        self.enumerate(path, ListScope::Immediate, |path| {
+            paths.push(path);
+            Ok(())
+        })
+        .map_err(io::Error::from)?;
+        Ok(paths)
     }
-
     fn list_recursively(
         &mut self,
         path: PathBuf,
-        tx: Sender<io::Result<Vec<PathBuf>>>,
+        sender: Sender<io::Result<Vec<PathBuf>>>,
     ) {
-        let mut to_process = vec![path];
-        let mut result = Vec::with_capacity(128);
-        while let Some(path) = to_process.pop() {
-            let response = self.get_blocking(path.clone()).unwrap();
-            if !response.status().is_success() {
-                tx.send(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Bad response code: {}", response.status()),
-                )))
-                .expect("Send failed");
-                continue;
+        let mut paths = Vec::new();
+        let result = self.enumerate(path, ListScope::Recursive, |path| {
+            paths.push(path);
+            if paths.len() == 128 {
+                sender.send(Ok(std::mem::take(&mut paths))).map_err(|_| {
+                    Error::Stream(io::Error::from(io::ErrorKind::BrokenPipe))
+                })?;
             }
-            let content_type = get_content_type(&response).unwrap();
-            if !is_directory_content_type(content_type) {
-                tx.send(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Invalid content type {}",
-                        content_type.to_str().unwrap()
-                    ),
-                )))
-                .expect("Send failed");
-                continue;
+            Ok(())
+        });
+        match result {
+            Ok(()) if !paths.is_empty() => {
+                let _ = sender.send(Ok(paths));
             }
-
-            let file_list: Vec<FileInfo> = response.json().unwrap_or_default();
-            for file in file_list {
-                let file_path = path.join(file.name);
-                if file.file_type == "file" {
-                    result.push(file_path);
-                } else {
-                    to_process.push(file_path)
-                }
+            Err(error) => {
+                let _ = sender.send(Err(error.into()));
             }
-
-            if result.len() > 100 {
-                tx.send(Ok(mem::take(&mut result))).expect("Send failed");
-            }
-        }
-        if !result.is_empty() {
-            tx.send(Ok(result)).expect("Send failed");
+            _ => {}
         }
     }
 }

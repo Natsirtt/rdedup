@@ -24,9 +24,10 @@ with-xz2 = ["rust-lzma"]
 with-zstd = ["zstd"]
 # Optional backends
 backend-b2 = ["backblaze-b2", "hyper", "hyper-native-tls"]
-backend-http = ["reqwest"]
+backend-http = ["reqwest", "dep:rdedup-protocol"]
 
 [dependencies]
+rdedup-protocol = { path = "../rdedup-protocol", optional = true }
 thiserror = { workspace = true }
 rdedup-cdc = "0.1.0"
 sodiumoxide = { version = "0.2", features = ["serde"] }
@@ -41,7 +42,7 @@ crossbeam-channel = "0.5.2"
 slog = "2.0.10"
 slog-perf = "0.2"
 hex = { workspace = true }
-sgdata = { version = "0.2.0", path = "../sgdata" }
+sgdata = { workspace = true }
 rand = "0.9.0"
 dangerous_option = "0.2"
 walkdir = "2"

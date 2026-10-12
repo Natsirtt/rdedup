@@ -915,3 +915,111 @@ async fn chunk_promotion_is_additive_and_rename_remains_exclusive() {
         b"nested name"
     );
 }
+
+#[tokio::test]
+async fn backend_traits_round_trip_objects_and_retain_worker_protection() {
+    use rdedup_lib::backends::{http::Http, Backend};
+    use std::io::ErrorKind;
+    let server = Server::start(false).await;
+    let address = server.address.clone();
+    tokio::task::spawn_blocking(move || {
+        let token = "ab".repeat(32).parse().unwrap();
+        let backend = Http::new(address.parse().unwrap(), Some(token)).unwrap();
+        let operation = backend.begin_shared().unwrap();
+        let mut worker = operation.new_thread().unwrap();
+        drop(operation);
+        worker
+            .create(
+                "0000000000000000-0000000000000000/name/client.yml".into(),
+                sgdata::SGData::from_single(b"original".to_vec()),
+            )
+            .unwrap();
+        worker
+            .create(
+                "0000000000000000-0000000000000000/name/client.yml".into(),
+                sgdata::SGData::from_single(b"replacement".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(
+            worker
+                .read(
+                    "0000000000000000-0000000000000000/name/client.yml".into()
+                )
+                .unwrap()
+                .into_linear_vec(),
+            b"original"
+        );
+        assert_eq!(
+            worker
+                .read_metadata(
+                    "0000000000000000-0000000000000000/name/client.yml".into()
+                )
+                .unwrap()
+                .len,
+            8
+        );
+        assert_eq!(
+            worker
+                .read_metadata(
+                    "0000000000000000-0000000000000000/name/absent.yml".into()
+                )
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            worker
+                .list("0000000000000000-0000000000000000/name".into())
+                .unwrap(),
+            [std::path::PathBuf::from(
+                "0000000000000000-0000000000000000/name/client.yml"
+            )]
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        worker.list_recursively(
+            "0000000000000000-0000000000000000".into(),
+            sender,
+        );
+        let paths: Vec<_> =
+            receiver.into_iter().flat_map(Result::unwrap).collect();
+        assert_eq!(
+            paths,
+            [std::path::PathBuf::from(
+                "0000000000000000-0000000000000000/name/client.yml"
+            )]
+        );
+        drop(worker);
+        let exclusive = backend.begin_exclusive().unwrap();
+        let mut worker = exclusive.new_thread().unwrap();
+        worker
+            .replace(
+                "0000000000000000-0000000000000000/name/client.yml".into(),
+                sgdata::SGData::from_single(b"replaced".to_vec()),
+            )
+            .unwrap();
+        worker
+            .rename(
+                "0000000000000000-0000000000000000/name/client.yml".into(),
+                "0000000000000000-0000000000000000/name/moved.yml".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            worker
+                .read("0000000000000000-0000000000000000/name/moved.yml".into())
+                .unwrap()
+                .into_linear_vec(),
+            b"replaced"
+        );
+        worker
+            .remove("0000000000000000-0000000000000000/name/moved.yml".into())
+            .unwrap();
+        worker
+            .remove("0000000000000000-0000000000000000/name/moved.yml".into())
+            .unwrap();
+        worker
+            .remove_dir_all("0000000000000000-0000000000000000".into())
+            .unwrap();
+    })
+    .await
+    .unwrap();
+}

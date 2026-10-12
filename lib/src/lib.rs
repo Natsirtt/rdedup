@@ -91,7 +91,7 @@ pub mod backends {
 
     #[cfg(feature = "backend-http")]
     pub mod http {
-        pub use crate::aio::http::{HttpReadOnly, HttpReadOnlyThread};
+        pub use crate::aio::http::{BearerToken, Error, Http, HttpThread};
     }
 
     #[cfg(feature = "backend-b2")]

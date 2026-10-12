@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
+sgdata = { workspace = true }
+rdedup-lib = { path = "../lib", default-features = false, features = ["backend-http"] }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }

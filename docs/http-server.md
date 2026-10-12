@@ -124,3 +124,19 @@ repository object listings and are never published names. Ensure the repository
 filesystem has space for in-flight temporary chunks as well as stored objects.
 The protocol replaces the old static read-only HTTP layout; upgrade clients and
 server together. Native server TLS is a possible future addition.
+
+## Large-publication acceptance test
+
+Run the explicit large-input test from the workspace root:
+
+```sh
+cargo test -p rdedup-server --test http multi_gigabyte_publication -- --ignored --nocapture
+```
+
+It publishes an uncompressed 4 GiB + 123 byte logical archive over HTTP, verifies
+all restored bytes, and checks that publishing the same contents under another
+name creates no new chunks. A deterministic repeating 64 KiB pattern avoids an
+archive-sized fixture and allows deduplication. This verifies large logical
+publication and reconstruction; it does not measure resident memory or the
+throughput of uploading 4 GiB of unique chunks. Reproducible performance
+measurement remains tracked in issue #30.

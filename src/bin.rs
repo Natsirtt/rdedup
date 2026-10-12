@@ -238,6 +238,7 @@ impl Options {
     }
 }
 
+mod publication_input;
 mod util;
 use crate::util::{read_new_passphrase, read_passphrase};
 
@@ -423,11 +424,14 @@ enum Command {
         pwhash: String,
     },
 
+    #[clap(visible_alias = "write")]
     /// Store data to repository
     Store {
         #[clap(name = "NAME")]
         /// Name to store to
         name: String,
+        #[clap(flatten)]
+        input: publication_input::Arguments,
     },
 
     /// Load data from repository
@@ -605,11 +609,12 @@ fn run() -> io::Result<()> {
                 log,
             )?;
         }
-        Command::Store { name } => {
+        Command::Store { name, input } => {
+            let input = input.prepare(io::stdin())?;
             let repo =
                 Repo::open(Arc::new(move || create_backend(&options)), log)?;
             let enc = repo.unlock_encrypt(&read_passphrase)?;
-            let stats = repo.write(&name, io::stdin(), &enc)?;
+            let stats = input.write(&repo, &name, &enc)?;
             println!("{} new chunks", stats.new_chunks);
             println!("{} new bytes", stats.new_bytes);
         }

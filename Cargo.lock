@@ -1319,6 +1319,8 @@ dependencies = [
  "slog",
  "slog-async",
  "slog-term",
+ "tempfile",
+ "thiserror",
  "url 2.2.2",
 ]
 

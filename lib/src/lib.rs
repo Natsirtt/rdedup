@@ -18,6 +18,7 @@ mod iterators;
 mod config;
 
 mod aio;
+pub use crate::aio::WriteStats;
 use crate::aio::*;
 
 mod chunking;

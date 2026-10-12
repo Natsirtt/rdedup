@@ -97,3 +97,36 @@ impl<Stream: Read + Send> Input<Stream> {
         .map_err(Error::Publication)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spooled_input_reopens_at_byte_zero_and_cleans_up() {
+        let input = Arguments {
+            input: None,
+            spool: true,
+        }
+        .prepare(&b"complete publication"[..])
+        .unwrap();
+        let Input::Spooled(spool) = input else {
+            panic!("explicit spooling must produce an owned temporary source");
+        };
+        let path = spool.path().to_owned();
+        let mut first = spool.reopen().unwrap();
+        let mut prefix = [0; 3];
+        first.read_exact(&mut prefix).unwrap();
+        let mut second = spool.reopen().unwrap();
+        let mut contents = Vec::new();
+        second.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"complete publication");
+        contents.clear();
+        first.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"plete publication");
+        drop(first);
+        drop(second);
+        drop(spool);
+        assert!(!path.exists());
+    }
+}

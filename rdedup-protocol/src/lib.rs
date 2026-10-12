@@ -7,3 +7,6 @@ pub mod lease;
 pub mod object;
 pub mod problem;
 pub mod route;
+
+/// Shared bearer credential representation.
+pub mod credential;

@@ -1,3 +1,5 @@
+#[path = "support/lost_response.rs"]
+mod lost_response;
 use rdedup_protocol::lease::{
     AcquireLease, Acquisition, LeaseGrant, LeaseMode, LeaseRequestId,
 };
@@ -24,14 +26,22 @@ impl Drop for Server {
 
 impl Server {
     async fn start(require_reads: bool) -> Self {
+        Self::with_timing(require_reads, 300, 900).await
+    }
+
+    async fn with_timing(
+        require_reads: bool,
+        lifetime_secs: u64,
+        grace_secs: u64,
+    ) -> Self {
         let directory = TempDir::new().unwrap();
         let configuration_path = directory.path().join("server.toml");
         let repository = directory.path().join("repository");
         std::fs::create_dir(&repository).unwrap();
         let configuration = format!(
             "repository = {}\nrequire_read_credentials = {require_reads}\n\
-             listen = '127.0.0.1:0'\nlease_lifetime_secs = 300\n\
-             exclusive_grace_secs = 900\nrequest_capacity = 4096\n\
+             listen = '127.0.0.1:0'\nlease_lifetime_secs = {lifetime_secs}\n\
+             exclusive_grace_secs = {grace_secs}\nrequest_capacity = 4096\n\
              request_idle_secs = 60\nrequest_retention_secs = 600\n\
              [[credentials]]\nname = 'one'\ntoken = '{}'\n\
              [[credentials]]\nname = 'two'\ntoken = '{}'\n",
@@ -913,5 +923,239 @@ async fn chunk_promotion_is_additive_and_rename_remains_exclusive() {
         std::fs::read(root.join(directory_destination).join("nested.yml"))
             .unwrap(),
         b"nested name"
+    );
+}
+
+#[tokio::test]
+async fn backend_traits_round_trip_objects_and_retain_worker_protection() {
+    use rdedup_lib::backends::{http::Http, Backend};
+    use std::io::ErrorKind;
+    let server = Server::start(false).await;
+    let address = server.address.clone();
+    tokio::task::spawn_blocking(move || {
+        let token = "ab".repeat(32).parse().unwrap();
+        let backend = Http::new(address.parse().unwrap(), Some(token)).unwrap();
+        let operation = backend.begin_shared().unwrap();
+        let mut worker = operation.new_thread().unwrap();
+        assert!(worker.list(".".into()).unwrap().is_empty());
+        assert!(worker.list(std::path::PathBuf::new()).unwrap().is_empty());
+        drop(operation);
+        worker
+            .create(
+                "0000000000000000-0000000000000000/name/client.yml".into(),
+                sgdata::SGData::from_single(b"original".to_vec()),
+            )
+            .unwrap();
+        worker
+            .create(
+                "0000000000000000-0000000000000000/name/client.yml".into(),
+                sgdata::SGData::from_single(b"replacement".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(
+            worker
+                .read(
+                    "0000000000000000-0000000000000000/name/client.yml".into()
+                )
+                .unwrap()
+                .into_linear_vec(),
+            b"original"
+        );
+        assert_eq!(
+            worker
+                .read_metadata(
+                    "0000000000000000-0000000000000000/name/client.yml".into()
+                )
+                .unwrap()
+                .len,
+            8
+        );
+        assert_eq!(
+            worker
+                .read_metadata(
+                    "0000000000000000-0000000000000000/name/absent.yml".into()
+                )
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            worker
+                .list("0000000000000000-0000000000000000/name".into())
+                .unwrap(),
+            [std::path::PathBuf::from(
+                "0000000000000000-0000000000000000/name/client.yml"
+            )]
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        worker.list_recursively(
+            "0000000000000000-0000000000000000".into(),
+            sender,
+        );
+        let paths: Vec<_> =
+            receiver.into_iter().flat_map(Result::unwrap).collect();
+        assert_eq!(
+            paths,
+            [std::path::PathBuf::from(
+                "0000000000000000-0000000000000000/name/client.yml"
+            )]
+        );
+        drop(worker);
+        let exclusive = backend.begin_exclusive().unwrap();
+        let mut worker = exclusive.new_thread().unwrap();
+        worker
+            .replace(
+                "0000000000000000-0000000000000000/name/client.yml".into(),
+                sgdata::SGData::from_single(b"replaced".to_vec()),
+            )
+            .unwrap();
+        worker
+            .rename(
+                "0000000000000000-0000000000000000/name/client.yml".into(),
+                "0000000000000000-0000000000000000/name/moved.yml".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            worker
+                .read("0000000000000000-0000000000000000/name/moved.yml".into())
+                .unwrap()
+                .into_linear_vec(),
+            b"replaced"
+        );
+        worker
+            .remove("0000000000000000-0000000000000000/name/moved.yml".into())
+            .unwrap();
+        worker
+            .remove("0000000000000000-0000000000000000/name/moved.yml".into())
+            .unwrap();
+        worker
+            .remove_dir_all("0000000000000000-0000000000000000".into())
+            .unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn client_renews_active_work_then_stops_at_an_exclusive_cutoff() {
+    use rdedup_lib::backends::{http::Http, Backend};
+    use std::io::ErrorKind;
+    use std::time::Instant;
+    let server = Server::with_timing(false, 2, 4).await;
+    let address = server.address.clone();
+    let (ready, renewed) = tokio::sync::oneshot::channel();
+    let client = tokio::task::spawn_blocking(move || {
+        let backend = Http::new(
+            address.parse().unwrap(),
+            Some("ab".repeat(32).parse().unwrap()),
+        )
+        .unwrap();
+        let operation = backend.begin_shared().unwrap();
+        let mut worker = operation.new_thread().unwrap();
+        worker
+            .create(
+                "config.yml".into(),
+                sgdata::SGData::from_single(b"configuration".to_vec()),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            worker.read_metadata("config.yml".into()).is_ok(),
+            "work must survive its initial lease lifetime"
+        );
+        ready.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            match worker.read_metadata("config.yml".into()) {
+                Ok(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "exclusive cutoff must stop renewals"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), ErrorKind::Interrupted);
+                    break;
+                }
+            }
+        }
+        let error = worker
+            .create(
+                "0000000000000000-0000000000000000/name/incomplete.yml".into(),
+                sgdata::SGData::from_single(b"must not publish".to_vec()),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Interrupted);
+        assert_eq!(
+            worker
+                .read_metadata("config.yml".into())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Interrupted,
+            "a lost operation must never acquire a substitute lease"
+        );
+    });
+    renewed.await.unwrap();
+    let request = LeaseRequestId::generate();
+    let response = server
+        .acquire(request, LeaseMode::Exclusive, Some(&"cd".repeat(32)))
+        .await;
+    assert!(matches!(
+        response.json::<Acquisition>().await.unwrap(),
+        Acquisition::Queued
+    ));
+    client.await.unwrap();
+    let grant = server.granted(request, Some(&"cd".repeat(32))).await;
+    assert_eq!(grant.mode, LeaseMode::Exclusive);
+    assert!(!server
+        ._directory
+        .path()
+        .join(
+            "repository/0000000000000000-0000000000000000/name/incomplete.yml"
+        )
+        .exists());
+}
+
+#[tokio::test]
+async fn client_recovers_a_committed_upload_after_losing_its_response() {
+    use rdedup_lib::backends::{http::Http, Backend};
+    let server = Server::start(false).await;
+    let mut proxy = lost_response::Proxy::start(
+        server.address.trim_start_matches("http://").to_owned(),
+    )
+    .await;
+    let address = proxy.address.clone();
+    tokio::task::spawn_blocking(move || {
+        let backend = Http::new(
+            address.parse().unwrap(),
+            Some("ab".repeat(32).parse().unwrap()),
+        )
+        .unwrap();
+        let operation = backend.begin_shared().unwrap();
+        let mut worker = operation.new_thread().unwrap();
+        worker
+            .create(
+                "config.yml".into(),
+                sgdata::SGData::from_many(vec![
+                    b"first".to_vec(),
+                    b"second".to_vec(),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            worker.read("config.yml".into()).unwrap().into_linear_vec(),
+            b"firstsecond"
+        );
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        proxy.events.recv().await.unwrap(),
+        lost_response::Event::CommittedWithoutResponse
+    );
+    assert_eq!(
+        proxy.events.recv().await.unwrap(),
+        lost_response::Event::RetriedWrite
     );
 }

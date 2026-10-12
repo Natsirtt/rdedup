@@ -1,17 +1,12 @@
 //! Named static bearer credentials; secret values never enter diagnostics.
 use crate::lease::{CredentialName, Principal};
+use rdedup_protocol::credential::BearerToken;
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::fmt;
 use std::str::FromStr;
-use subtle::ConstantTimeEq;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
-    #[error(
-        "bearer token must encode 32 random bytes as 64 hexadecimal characters"
-    )]
-    TokenFormat,
     #[error("at least one named bearer credential is required")]
     Empty,
     #[error("credential names and tokens must be unique")]
@@ -20,32 +15,6 @@ pub(crate) enum Error {
     EnvironmentFormat,
     #[error("missing or invalid bearer credentials")]
     Unauthorized,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(try_from = "String")]
-struct BearerToken([u8; 32]);
-
-impl fmt::Debug for BearerToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("BearerToken([redacted])")
-    }
-}
-
-impl FromStr for BearerToken {
-    type Err = Error;
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let mut bytes = [0; 32];
-        hex::decode_to_slice(text, &mut bytes)
-            .map_err(|_| Error::TokenFormat)?;
-        Ok(Self(bytes))
-    }
-}
-impl TryFrom<String> for BearerToken {
-    type Error = Error;
-    fn try_from(text: String) -> Result<Self, Self::Error> {
-        text.parse()
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -70,7 +39,7 @@ impl TryFrom<Vec<Credential>> for Credentials {
         let mut tokens = HashSet::new();
         for credential in &credentials {
             if !names.insert(&credential.name)
-                || !tokens.insert(credential.token.0)
+                || !tokens.insert(&credential.token)
             {
                 return Err(Error::Duplicate);
             }
@@ -104,7 +73,7 @@ impl Credentials {
             .map_err(|_| Error::Unauthorized)?;
         let mut authenticated = None;
         for credential in &self.0 {
-            if bool::from(credential.token.0.ct_eq(&supplied.0)) {
+            if credential.token == supplied {
                 authenticated =
                     Some(Principal::Credential(credential.name.clone()));
             }

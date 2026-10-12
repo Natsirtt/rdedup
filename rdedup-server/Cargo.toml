@@ -18,10 +18,11 @@ futures-util = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-subtle = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
+sgdata = { workspace = true }
+rdedup-lib = { path = "../lib", default-features = false, features = ["backend-http"] }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }

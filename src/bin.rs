@@ -357,6 +357,18 @@ struct CliOpts {
 #[derive(Debug, Subcommand)]
 #[clap(setting = clap::AppSettings::DeriveDisplayOrder)]
 enum Command {
+    /// Serve a repository over plain HTTP behind a trusted TLS reverse proxy
+    Serve {
+        #[clap(flatten)]
+        arguments: rdedup_server::command::Arguments,
+    },
+    #[clap(flatten)]
+    Repository(RepositoryCommand),
+}
+
+#[derive(Debug, Subcommand)]
+#[clap(setting = clap::AppSettings::DeriveDisplayOrder)]
+enum RepositoryCommand {
     #[clap(setting = clap::AppSettings::DeriveDisplayOrder)]
     /// Create a new repository
     Init {
@@ -504,6 +516,13 @@ fn create_backend(
 fn run() -> io::Result<()> {
     let cli_opts = CliOpts::parse();
 
+    let command = match cli_opts.command {
+        Command::Serve { arguments } => {
+            return arguments.run().map_err(io::Error::other);
+        }
+        Command::Repository(command) => command,
+    };
+
     let url: Url = if let Some(loc) = cli_opts.repo_uri {
         let s = loc.into_string().map_err(|_| {
             io::Error::new(
@@ -559,8 +578,8 @@ fn run() -> io::Result<()> {
     let log =
         create_logger(cli_opts.verbose as u32, cli_opts.verbose_timings as u32);
 
-    match cli_opts.command {
-        Command::Init {
+    match command {
+        RepositoryCommand::Init {
             chunking,
             chunk_size,
             encryption,
@@ -609,7 +628,7 @@ fn run() -> io::Result<()> {
                 log,
             )?;
         }
-        Command::Store { name, input } => {
+        RepositoryCommand::Store { name, input } => {
             let input = input.prepare(io::stdin())?;
             let repo =
                 Repo::open(Arc::new(move || create_backend(&options)), log)?;
@@ -618,27 +637,27 @@ fn run() -> io::Result<()> {
             println!("{} new chunks", stats.new_chunks);
             println!("{} new bytes", stats.new_bytes);
         }
-        Command::Load { name } => {
+        RepositoryCommand::Load { name } => {
             let repo =
                 Repo::open(Arc::new(move || create_backend(&options)), log)?;
             let dec = repo.unlock_decrypt(&read_passphrase)?;
             repo.read(&name, &mut io::stdout(), &dec)?;
         }
-        Command::ChangePassphrase => {
+        RepositoryCommand::ChangePassphrase => {
             let mut repo =
                 Repo::open(Arc::new(move || create_backend(&options)), log)?;
             repo.change_passphrase(&read_passphrase, &|| {
                 read_new_passphrase()
             })?;
         }
-        Command::Remove { names } => {
+        RepositoryCommand::Remove { names } => {
             let repo =
                 Repo::open(Arc::new(move || create_backend(&options)), log)?;
             for name in names {
                 repo.rm(&name)?;
             }
         }
-        Command::Du { names } => {
+        RepositoryCommand::Du { names } => {
             let repo =
                 Repo::open(Arc::new(move || create_backend(&options)), log)?;
             let dec = repo.unlock_decrypt(&read_passphrase)?;
@@ -649,13 +668,13 @@ fn run() -> io::Result<()> {
                 println!("{} bytes", result.bytes);
             }
         }
-        Command::Gc { grace_time } => {
+        RepositoryCommand::Gc { grace_time } => {
             let repo =
                 Repo::open(Arc::new(move || create_backend(&options)), log)?;
 
             repo.gc(grace_time)?;
         }
-        Command::List => {
+        RepositoryCommand::List => {
             let repo =
                 Repo::open(Arc::new(move || create_backend(&options)), log)?;
 
@@ -663,7 +682,7 @@ fn run() -> io::Result<()> {
                 println!("{}", name);
             }
         }
-        Command::Verify { names } => {
+        RepositoryCommand::Verify { names } => {
             let repo =
                 Repo::open(Arc::new(move || create_backend(&options)), log)?;
             let dec = repo.unlock_decrypt(&read_passphrase)?;

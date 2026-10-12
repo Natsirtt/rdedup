@@ -19,9 +19,83 @@ use std::sync::Arc;
 /// Server startup or listener failure.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The configured repository root is absent or is not an accessible directory.
+    #[error("repository directory {path} is unavailable: {source}")]
+    Repository {
+        /// Configured repository location.
+        path: std::path::PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// Binding or serving the selected TCP address failed.
     #[error("HTTP listener failed")]
     Listen(#[from] std::io::Error),
+}
+
+/// A validated repository service with an owned, bound TCP listener.
+pub struct Server {
+    listener: tokio::net::TcpListener,
+    address: std::net::SocketAddr,
+    routes: Router,
+}
+
+impl Server {
+    /// Validate the repository directory before binding the HTTP listener.
+    ///
+    /// An existing empty directory can be initialized through the HTTP backend.
+    ///
+    /// # Errors
+    /// Returns inaccessible repository, TCP binding or listener-address failures.
+    pub async fn bind(mut configuration: Configuration) -> Result<Self, Error> {
+        let validate = || {
+            let path = std::fs::canonicalize(&configuration.repository)?;
+            std::fs::read_dir(&path)?;
+            let storage = rdedup_lib::backends::local::Local::new(path.clone());
+            match storage.try_shared_operation() {
+                Ok(_protection) => {}
+                // Startup only probes access. Each request still acquires its
+                // own protection after an existing exclusive holder releases.
+                Err(error)
+                    if error.raw_os_error()
+                        == fs2::lock_contended_error().raw_os_error() => {}
+                Err(error) => return Err(error),
+            }
+            Ok::<_, std::io::Error>(path)
+        };
+        configuration.repository =
+            validate().map_err(|source| Error::Repository {
+                path: configuration.repository.clone(),
+                source,
+            })?;
+        let listener =
+            tokio::net::TcpListener::bind(configuration.listen).await?;
+        let address = listener.local_addr()?;
+        Ok(Self {
+            listener,
+            address,
+            routes: router(configuration),
+        })
+    }
+
+    /// Actual bound address, including an OS-selected port when configured as zero.
+    pub fn address(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
+    /// Accept requests until shutdown, then finish active connections.
+    ///
+    /// # Errors
+    /// Returns a listener failure while serving requests.
+    pub async fn run(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), Error> {
+        axum::serve(self.listener, self.routes)
+            .with_graceful_shutdown(shutdown)
+            .await?;
+        Ok(())
+    }
 }
 
 pub(crate) struct Repository {
@@ -85,7 +159,7 @@ impl Repository {
 ///
 /// # Panics
 /// Requires a Tokio runtime with time support for the lease coordinator.
-pub fn router(configuration: Configuration) -> Router {
+fn router(configuration: Configuration) -> Router {
     let repository = Arc::new(Repository {
         leases: LeaseService::with_request_policy(
             configuration.repository,
@@ -122,16 +196,12 @@ pub fn router(configuration: Configuration) -> Router {
 /// Serve plain HTTP until shutdown. Deploy behind a trusted TLS reverse proxy.
 ///
 /// # Errors
-/// Returns a TCP bind or listener failure.
+/// Returns repository validation, TCP bind or listener failure.
 pub async fn serve(
     configuration: Configuration,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Error> {
-    let listener = tokio::net::TcpListener::bind(configuration.listen).await?;
-    axum::serve(listener, router(configuration))
-        .with_graceful_shutdown(shutdown)
-        .await?;
-    Ok(())
+    Server::bind(configuration).await?.run(shutdown).await
 }
 
 async fn acquire(

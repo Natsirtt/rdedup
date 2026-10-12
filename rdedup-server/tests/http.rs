@@ -54,13 +54,12 @@ impl Server {
         std::fs::write(&configuration_path, configuration).unwrap();
         let configuration =
             Configuration::load(Some(&configuration_path)).unwrap();
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = rdedup_server::server::Server::bind(configuration)
+            .await
+            .unwrap();
+        let address = format!("http://{}", server.address());
         let task = tokio::spawn(async move {
-            axum::serve(listener, rdedup_server::server::router(configuration))
-                .await
-                .unwrap();
+            server.run(std::future::pending()).await.unwrap();
         });
         Self {
             address,

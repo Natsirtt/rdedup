@@ -24,14 +24,22 @@ impl Drop for Server {
 
 impl Server {
     async fn start(require_reads: bool) -> Self {
+        Self::with_timing(require_reads, 300, 900).await
+    }
+
+    async fn with_timing(
+        require_reads: bool,
+        lifetime_secs: u64,
+        grace_secs: u64,
+    ) -> Self {
         let directory = TempDir::new().unwrap();
         let configuration_path = directory.path().join("server.toml");
         let repository = directory.path().join("repository");
         std::fs::create_dir(&repository).unwrap();
         let configuration = format!(
             "repository = {}\nrequire_read_credentials = {require_reads}\n\
-             listen = '127.0.0.1:0'\nlease_lifetime_secs = 300\n\
-             exclusive_grace_secs = 900\nrequest_capacity = 4096\n\
+             listen = '127.0.0.1:0'\nlease_lifetime_secs = {lifetime_secs}\n\
+             exclusive_grace_secs = {grace_secs}\nrequest_capacity = 4096\n\
              request_idle_secs = 60\nrequest_retention_secs = 600\n\
              [[credentials]]\nname = 'one'\ntoken = '{}'\n\
              [[credentials]]\nname = 'two'\ntoken = '{}'\n",
@@ -1023,3 +1031,85 @@ async fn backend_traits_round_trip_objects_and_retain_worker_protection() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn client_renews_active_work_then_stops_at_an_exclusive_cutoff() {
+    use rdedup_lib::backends::{http::Http, Backend};
+    use std::io::ErrorKind;
+    use std::time::Instant;
+    let server = Server::with_timing(false, 2, 4).await;
+    let address = server.address.clone();
+    let (ready, renewed) = tokio::sync::oneshot::channel();
+    let client = tokio::task::spawn_blocking(move || {
+        let backend = Http::new(
+            address.parse().unwrap(),
+            Some("ab".repeat(32).parse().unwrap()),
+        )
+        .unwrap();
+        let operation = backend.begin_shared().unwrap();
+        let mut worker = operation.new_thread().unwrap();
+        worker
+            .create(
+                "config.yml".into(),
+                sgdata::SGData::from_single(b"configuration".to_vec()),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            worker.read_metadata("config.yml".into()).is_ok(),
+            "work must survive its initial lease lifetime"
+        );
+        ready.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            match worker.read_metadata("config.yml".into()) {
+                Ok(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "exclusive cutoff must stop renewals"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), ErrorKind::Interrupted);
+                    break;
+                }
+            }
+        }
+        let error = worker
+            .create(
+                "0000000000000000-0000000000000000/name/incomplete.yml".into(),
+                sgdata::SGData::from_single(b"must not publish".to_vec()),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Interrupted);
+        assert_eq!(
+            worker
+                .read_metadata("config.yml".into())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Interrupted,
+            "a lost operation must never acquire a substitute lease"
+        );
+    });
+    renewed.await.unwrap();
+    let request = LeaseRequestId::generate();
+    let response = server
+        .acquire(request, LeaseMode::Exclusive, Some(&"cd".repeat(32)))
+        .await;
+    assert!(matches!(
+        response.json::<Acquisition>().await.unwrap(),
+        Acquisition::Queued
+    ));
+    client.await.unwrap();
+    let grant = server.granted(request, Some(&"cd".repeat(32))).await;
+    assert_eq!(grant.mode, LeaseMode::Exclusive);
+    assert!(!server
+        ._directory
+        .path()
+        .join(
+            "repository/0000000000000000-0000000000000000/name/incomplete.yml"
+        )
+        .exists());
+}
+

@@ -3,7 +3,7 @@ use super::error::Error;
 use super::timing::Timing;
 use super::transport::{Retry, Transport};
 use rdedup_protocol::lease::{
-    AcquireLease, Acquisition, LeaseGrant, LeaseId, LeaseMode, LeaseRequestId,
+    AcquireLease, Acquisition, LeaseId, LeaseMode, LeaseRequestId,
 };
 use rdedup_protocol::problem::ProblemKind;
 use rdedup_protocol::route;
@@ -207,12 +207,20 @@ impl Renewal {
             .transport
             .endpoint(route::LEASES, Some(&self.id.to_string()))?;
         let started = Instant::now();
-        let grant: LeaseGrant = self
+        let renewal: Acquisition = self
             .transport
             .execute(Retry::Idempotent, || {
                 Ok(self.transport.request(Method::PATCH, url.clone()))
             })?
             .json()?;
-        self.timing.update(&grant, started)
+        match renewal {
+            Acquisition::Granted { lease } => {
+                self.timing.update(&lease, started)
+            }
+            Acquisition::Closed => {
+                Err(Error::Problem(ProblemKind::LeaseExpired))
+            }
+            Acquisition::Queued => Err(Error::Protocol),
+        }
     }
 }

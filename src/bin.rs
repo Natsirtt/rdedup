@@ -43,8 +43,8 @@
 //! or `rdup` tools. Built-in directory traversal could improve deduplication
 //! ratio for workloads with many small, frequently changing files.
 //!
-//! Cloud storage integrations are missing. The architecture to support it is
-//! mostly implemented, but the actual backends are not.
+//! HTTP repositories support remote reads and writes through the existing backend
+//! API. Other cloud integrations remain incomplete.
 //!
 //! ## Installation
 //!

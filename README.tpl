@@ -19,6 +19,11 @@ See [wiki](https://github.com/dpc/{{crate}}/wiki) for current project status.
 
 {{readme}}
 
+## HTTP repositories
+
+See the [HTTP server and proxy setup](docs/http-server.md) and
+[publication input and replay](docs/publication.md) guides.
+
 # License
 
 {{crate}} is licensed under: {{license}}

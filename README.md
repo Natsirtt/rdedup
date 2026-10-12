@@ -15,6 +15,8 @@
 
 # rdedup
 
+See the [HTTP server and proxy setup](docs/http-server.md) and
+[publication input and replay](docs/publication.md) guides.
 
 
 `rdedup` is a data deduplication engine and a backup software.
@@ -68,8 +70,8 @@ directory traversal), and because of that it's typically paired with `tar`
 or `rdup` tools. Built-in directory traversal could improve deduplication
 ratio for workloads with many small, frequently changing files.
 
-Cloud storage integrations are missing. The architecture to support it is
-mostly implemented, but the actual backends are not.
+HTTP repositories support remote reads and writes through the existing backend
+API. Other cloud integrations remain incomplete.
 
 ### Installation
 

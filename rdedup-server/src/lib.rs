@@ -3,6 +3,7 @@
 pub mod lease;
 
 mod authentication;
+pub mod command;
 pub mod configuration;
 mod setting;
 

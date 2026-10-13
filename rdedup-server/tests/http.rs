@@ -2,6 +2,8 @@
 mod lost_response;
 #[path = "support/paused_input.rs"]
 mod paused_input;
+#[path = "support/repeated_input.rs"]
+mod repeated_input;
 use rdedup_protocol::lease::{
     AcquireLease, Acquisition, LeaseGrant, LeaseMode, LeaseRequestId,
 };
@@ -54,13 +56,12 @@ impl Server {
         std::fs::write(&configuration_path, configuration).unwrap();
         let configuration =
             Configuration::load(Some(&configuration_path)).unwrap();
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = rdedup_server::server::Server::bind(configuration)
+            .await
+            .unwrap();
+        let address = format!("http://{}", server.address());
         let task = tokio::spawn(async move {
-            axum::serve(listener, rdedup_server::server::router(configuration))
-                .await
-                .unwrap();
+            server.run(std::future::pending()).await.unwrap();
         });
         Self {
             address,
@@ -1205,7 +1206,7 @@ async fn repository_replays_after_exclusive_handoff_and_reuses_chunks() {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-                seed as u8
+                seed.to_le_bytes()[0]
             })
             .collect::<Vec<_>>()
             .into();
@@ -1292,4 +1293,79 @@ async fn repository_replays_after_exclusive_handoff_and_reuses_chunks() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "explicit multi-gigabyte HTTP acceptance test"]
+async fn multi_gigabyte_publication_restores_every_byte_without_an_archive_buffer(
+) {
+    use rdedup_lib::backends::http::Http;
+    use rdedup_lib::publication::WriteRetryPolicy;
+    use rdedup_lib::{settings, Repo};
+    use std::sync::Arc;
+    const LENGTH: u64 = 4 * 1024 * 1024 * 1024 + 123;
+    let server = Server::start(false).await;
+    let address = server.address.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut settings = settings::Repo::new();
+        settings
+            .set_compression(settings::Compression::None)
+            .unwrap();
+        settings.use_fastcdc_chunking(Some(20)).unwrap();
+        let repository = Repo::init(
+            Arc::new(move || {
+                Ok(Box::new(
+                    Http::new(
+                        address.parse().unwrap(),
+                        Some("ab".repeat(32).parse().unwrap()),
+                    )
+                    .unwrap(),
+                ))
+            }),
+            &|| Ok(String::new()),
+            settings,
+            None,
+        )
+        .unwrap();
+        let encryption =
+            repository.unlock_encrypt(&|| Ok(String::new())).unwrap();
+        let decryption =
+            repository.unlock_decrypt(&|| Ok(String::new())).unwrap();
+        let mut seed = 57_u64;
+        let pattern: Arc<[u8]> = (0..65_536)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let mut source =
+            || Ok(repeated_input::Input::new(Arc::clone(&pattern), LENGTH));
+        repository
+            .write_replayable(
+                "large",
+                &mut source,
+                &encryption,
+                WriteRetryPolicy::default(),
+            )
+            .unwrap();
+        let mut verifier = repeated_input::Verifier::new(Arc::clone(&pattern));
+        repository
+            .read("large", &mut verifier, &decryption)
+            .unwrap();
+        assert_eq!(verifier.bytes_verified(), LENGTH);
+        let duplicate = repository
+            .write_replayable(
+                "same",
+                &mut source,
+                &encryption,
+                WriteRetryPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(duplicate.new_chunks, 0);
+    })
+    .await
+    .unwrap();
 }

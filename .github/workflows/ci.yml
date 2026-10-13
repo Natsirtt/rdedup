@@ -88,3 +88,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  container:
+    name: Linux HTTP container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag rdedup-http:validation .
+      - run: python3 scripts/test-http-container.py --image rdedup-http:validation

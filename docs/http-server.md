@@ -140,3 +140,50 @@ archive-sized fixture and allows deduplication. This verifies large logical
 publication and reconstruction; it does not measure resident memory or the
 throughput of uploading 4 GiB of unique chunks. Reproducible performance
 measurement remains tracked in issue #30.
+
+## Linux container
+
+Build the image from the repository root:
+
+```sh
+docker build --tag rdedup-http:local .
+```
+
+The image includes both binaries and runs the server as UID/GID 10001. The
+repository defaults to `/repository`; the listener defaults to `0.0.0.0:8080`
+inside the container. A config file can override these environment defaults, so
+omit `repository` and `listen` from the file to retain the container layout.
+Supply the credentials and other settings in a read-only mounted file.
+
+```sh
+docker volume create rdedup-repository
+docker run --detach --name rdedup \
+  --read-only --tmpfs /tmp:rw,nosuid,nodev \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --publish 127.0.0.1:8080:8080 \
+  --mount type=volume,source=rdedup-repository,target=/repository \
+  --mount type=bind,source=/absolute/path/server.toml,target=/etc/rdedup.toml,readonly \
+  rdedup-http:local --config /etc/rdedup.toml
+```
+
+A new named volume inherits the image directory's ownership. For an existing
+volume or host-directory mount, arrange read/write access for UID/GID 10001;
+the server does not change repository ownership. The host loopback port is for a
+host-local proxy. If Nginx Proxy Manager runs in Docker, attach both services to
+a private Docker network and forward to `rdedup:8080`, omitting `--publish`.
+Keep only the proxy's TLS listener publicly reachable.
+
+`docker stop --time 30 rdedup` sends SIGTERM and allows active requests to drain.
+A timeout forces termination; clients must restart interrupted publications
+from their replayable source. Repository contents remain in the mounted volume.
+
+Run the container acceptance test with Python 3.9 or later:
+
+```sh
+python scripts/test-http-container.py --image rdedup-http:local
+```
+
+It uses an isolated named volume and container with a loopback-only port, checks
+non-root execution, remote publication and restoration, equivalent-name retries,
+conflicts, authenticated reads, GC, persistence across restart, rejection of pre-restart leases and SIGTERM exit.
+Its temporary container and volume are removed on exit.

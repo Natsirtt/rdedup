@@ -1,0 +1,8 @@
+.git
+**/target
+**/.cargo
+backup
+testdata
+*.log
+.env
+server.toml

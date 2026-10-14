@@ -1216,9 +1216,9 @@ fn cache_population_uses_shared_protection_and_preserves_storage_errors() {
         .write(true)
         .open(cache_directory.join(".lock"))
         .unwrap();
-    fs2::FileExt::try_lock_shared(&observer).unwrap();
-    fs2::FileExt::unlock(&observer).unwrap();
-    assert!(fs2::FileExt::try_lock_exclusive(&observer).is_err());
+    observer.try_lock_shared().unwrap();
+    observer.unlock().unwrap();
+    assert!(observer.try_lock().is_err());
     let mut worker = operation.new_thread().unwrap();
     assert_eq!(
         worker.read("object".into()).unwrap().into_linear_vec(),

@@ -43,19 +43,23 @@ Windows and Linux (Docker) process checks passed during the 2026-10-13
 investigation. These are local-filesystem checks; they do not
 establish cross-host or network-mount behavior.
 
-## Standard-library option
+## Standard-library locking
 
-Rust 1.89 introduced `File::lock`, `lock_shared`, `try_lock` and
-`try_lock_shared`. The try methods distinguish contention through
-`TryLockError::WouldBlock`. This could replace the current fs2 dependency and
-raw OS error-code comparisons without changing operation ownership. The
-standard library currently uses `flock` on Unix and `LockFileEx` on Windows;
-changing Rust wrappers does not make filesystem locking distributed or stronger.
+Local protection uses the standard-library `File` locking API. Nonblocking
+operation acquisition returns `TryLockError::WouldBlock` for contention and
+`TryLockError::Error` for filesystem failures. The HTTP coordinator queues only
+contention; other acquisition failures reach the caller. Startup similarly
+accepts a busy repository but rejects inaccessible lock storage.
+
+The API requires Rust 1.89 or newer. Validation uses the installed and CI
+compiler versions; this is not an independently tested minimum compiler promise.
+The standard library currently uses `flock` on Unix and `LockFileEx` on Windows.
 See the [standard-library locking API](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock).
 
-Before a migration, test interoperability with existing holders and preserve
-separate opens per independent operation. Do not acquire a second lock through
-a cloned handle or silently turn acquisition errors into permission to proceed.
+Independent operations open separate file handles. Workers and streams retain
+their original operation owner; no second lock is acquired through a cloned
+handle. Acquisition errors never authorize protected work. Legacy fs2 holder
+interoperability is not an acceptance target for the single-deployment upgrade.
 
 ## Network-mounted repositories
 

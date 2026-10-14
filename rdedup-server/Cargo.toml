@@ -10,7 +10,6 @@ clap = { workspace = true }
 rdedup-protocol = { path = "../rdedup-protocol" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-fs2 = { workspace = true }
 rdedup-lib = { path = "../lib", default-features = false }
 
 

@@ -537,16 +537,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "futures-channel"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1357,7 +1347,6 @@ dependencies = [
  "dangerous_option",
  "digest 0.10.3",
  "flate2",
- "fs2",
  "hex",
  "hyper 1.6.0",
  "hyper-native-tls",
@@ -1401,7 +1390,6 @@ version = "3.2.0"
 dependencies = [
  "axum",
  "clap",
- "fs2",
  "futures-util",
  "hex",
  "rdedup-lib",

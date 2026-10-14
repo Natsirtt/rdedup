@@ -81,3 +81,40 @@ impl From<Error> for io::Error {
         io::Error::new(kind, error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::ProtectionError;
+    use std::io::Read;
+
+    #[test]
+    fn upload_body_failure_retains_typed_protection_loss() {
+        struct LostProtection;
+        impl Read for LostProtection {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(ProtectionError::Lost {
+                    source: Box::new(io::Error::from(io::ErrorKind::TimedOut)),
+                }
+                .into())
+            }
+        }
+
+        // A reachable listener separates the body failure from connection refusal.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let failure = client
+            .put(format!("http://{}", listener.local_addr().unwrap()))
+            .body(reqwest::blocking::Body::new(LostProtection))
+            .send()
+            .unwrap_err();
+        let propagated = io::Error::from(Error::Request(failure));
+        assert!(
+            ProtectionError::find_in(&propagated).is_some(),
+            "a transport body wrapper must not prevent whole-publication replay: {propagated:?}"
+        );
+    }
+}

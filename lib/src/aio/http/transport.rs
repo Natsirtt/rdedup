@@ -136,4 +136,133 @@ mod tests {
             assert!(Transport::new(url.parse().unwrap(), None).is_err());
         }
     }
+
+    enum Reply {
+        Success,
+        Problem(rdedup_protocol::problem::ProblemKind),
+    }
+
+    fn assert_attempts(
+        replies: Vec<Reply>,
+        retry: Retry,
+        expected: Result<(), rdedup_protocol::problem::ProblemKind>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let expected_attempts = replies.len();
+        let responder = std::thread::spawn(move || {
+            for reply in replies {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut connection = loop {
+                    match listener.accept() {
+                        Ok((connection, _)) => break connection,
+                        Err(error)
+                            if error.kind()
+                                == std::io::ErrorKind::WouldBlock =>
+                        {
+                            assert!(
+                                Instant::now() < deadline,
+                                "expected request never arrived"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    }
+                };
+                connection.set_nonblocking(false).unwrap();
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&connection);
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = match reply {
+                    Reply::Success => "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+                    Reply::Problem(kind) => {
+                        let problem = serde_json::to_string(&Problem {
+                            kind,
+                            detail: "injected response".to_owned(),
+                        }).unwrap();
+                        format!("HTTP/1.1 {}\r\n{}: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", kind.status(), route::PROBLEM_HEADER, problem)
+                    }
+                };
+                connection.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let transport = Transport::new(address.parse().unwrap(), None).unwrap();
+        let mut attempts = 0;
+        let outcome = transport.execute(retry, || {
+            attempts += 1;
+            Ok(transport
+                .request(reqwest::Method::GET, address.parse().unwrap()))
+        });
+        responder.join().unwrap();
+        assert_eq!(attempts, expected_attempts);
+        match (outcome, expected) {
+            (Ok(_), Ok(())) => {}
+            (Err(Error::Problem(actual)), Err(expected)) => {
+                assert_eq!(actual, expected)
+            }
+            (actual, expected) => {
+                panic!("unexpected result: {actual:?}; expected {expected:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn idempotent_requests_recover_transient_failures_with_at_most_three_attempts(
+    ) {
+        use rdedup_protocol::problem::ProblemKind::Unavailable;
+        assert_attempts(
+            vec![Reply::Problem(Unavailable), Reply::Success],
+            Retry::Idempotent,
+            Ok(()),
+        );
+        assert_attempts(
+            vec![
+                Reply::Problem(Unavailable),
+                Reply::Problem(Unavailable),
+                Reply::Problem(Unavailable),
+            ],
+            Retry::Idempotent,
+            Err(Unavailable),
+        );
+    }
+
+    #[test]
+    fn permanent_problems_and_non_idempotent_requests_are_not_retried() {
+        use rdedup_protocol::problem::ProblemKind;
+        for kind in [
+            ProblemKind::InvalidRequest,
+            ProblemKind::Unauthorized,
+            ProblemKind::Forbidden,
+            ProblemKind::AlreadyExists,
+            ProblemKind::RequestConflict,
+            ProblemKind::LeaseExpired,
+            ProblemKind::RenewalClosed,
+            ProblemKind::LeaseMode,
+            ProblemKind::StorageFailure,
+        ] {
+            assert_attempts(
+                vec![Reply::Problem(kind)],
+                Retry::Idempotent,
+                Err(kind),
+            );
+        }
+        assert_attempts(
+            vec![Reply::Problem(ProblemKind::Unavailable)],
+            Retry::Never,
+            Err(ProblemKind::Unavailable),
+        );
+    }
 }

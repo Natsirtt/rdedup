@@ -1164,7 +1164,7 @@ async fn client_recovers_a_committed_upload_after_losing_its_response() {
 }
 
 #[tokio::test]
-async fn repository_replays_after_exclusive_handoff_and_reuses_chunks() {
+async fn repository_replays_after_gc_moves_its_reusable_chunks() {
     use rdedup_lib::backends::http::Http;
     use rdedup_lib::publication::WriteRetryPolicy;
     use rdedup_lib::{settings, Repo};
@@ -1210,13 +1210,16 @@ async fn repository_replays_after_exclusive_handoff_and_reuses_chunks() {
             })
             .collect::<Vec<_>>()
             .into();
+        repository
+            .write("seed", Cursor::new(Arc::clone(&bytes)), &encryption)
+            .unwrap();
         let mut pause = Some(paused_input::Pause::new(reached, resumed));
         let mut attempts = 0;
         let mut source = || {
             attempts += 1;
             Ok(paused_input::Input::new(Arc::clone(&bytes), pause.take()))
         };
-        repository
+        let replay = repository
             .write_replayable(
                 "archive",
                 &mut source,
@@ -1225,6 +1228,10 @@ async fn repository_replays_after_exclusive_handoff_and_reuses_chunks() {
             )
             .unwrap();
         assert_eq!(attempts, 2, "lease loss must restart the complete source");
+        assert_eq!(
+            replay.new_chunks, 0,
+            "GC-moved chunks must remain reusable"
+        );
         let mut restored = Vec::new();
         repository
             .read("archive", &mut restored, &decryption)
@@ -1252,6 +1259,7 @@ async fn repository_replays_after_exclusive_handoff_and_reuses_chunks() {
         assert_eq!(restored, bytes.as_ref());
         repository.rm("archive").unwrap();
         repository.rm("second").unwrap();
+        repository.rm("seed").unwrap();
         repository.gc(0).unwrap();
         assert!(repository.list_names().unwrap().is_empty());
     });
@@ -1288,6 +1296,33 @@ async fn repository_replays_after_exclusive_handoff_and_reuses_chunks() {
         .unwrap()
         .error_for_status()
         .unwrap();
+    let address = server.address.clone();
+    tokio::task::spawn_blocking(move || {
+        let repository = Repo::open(
+            Arc::new(move || {
+                Ok(Box::new(
+                    Http::new(
+                        address.parse().unwrap(),
+                        Some("cd".repeat(32).parse().unwrap()),
+                    )
+                    .unwrap(),
+                ))
+            }),
+            None,
+        )
+        .unwrap();
+        repository.gc(0).unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(
+        !server
+            ._directory
+            .path()
+            .join("repository/0000000000000000-0000000000000000")
+            .exists(),
+        "GC must remove the generation captured by the interrupted writer"
+    );
     resume.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(30), publication)
         .await

@@ -31,7 +31,6 @@ rdedup-protocol = { path = "../rdedup-protocol", optional = true }
 thiserror = { workspace = true }
 rdedup-cdc = "0.1.0"
 sodiumoxide = { version = "0.2", features = ["serde"] }
-fs2 = { workspace = true }
 serde = { workspace = true }
 serde_yaml = "0.9.9"
 base64 = "0.22.1"

@@ -158,11 +158,14 @@ impl Local {
     /// Try shared protection without blocking behind an exclusive operation.
     ///
     /// # Errors
-    /// Returns a filesystem failure or the operating system's lock-contention
-    /// error when another operation owns incompatible protection.
-    pub fn try_shared_operation(&self) -> io::Result<LocalOperation<Shared>> {
-        let file = self.open_lock_file()?;
-        fs2::FileExt::try_lock_shared(&file)?;
+    /// Returns `fs::TryLockError::Error` for a filesystem failure, or
+    /// `fs::TryLockError::WouldBlock` when another operation owns incompatible
+    /// protection.
+    pub fn try_shared_operation(
+        &self,
+    ) -> Result<LocalOperation<Shared>, fs::TryLockError> {
+        let file = self.open_lock_file().map_err(fs::TryLockError::Error)?;
+        file.try_lock_shared()?;
         Ok(LocalOperation {
             protection: Arc::new(LocalProtection {
                 path: self.path.clone(),
@@ -175,13 +178,14 @@ impl Local {
     /// Try exclusive protection without blocking the lease coordinator.
     ///
     /// # Errors
-    /// Returns a filesystem failure or the operating system's lock-contention
-    /// error while any incompatible operation or stream retains protection.
+    /// Returns `fs::TryLockError::Error` for a filesystem failure, or
+    /// `fs::TryLockError::WouldBlock` while any incompatible operation or stream
+    /// retains protection.
     pub fn try_exclusive_operation(
         &self,
-    ) -> io::Result<LocalOperation<Exclusive>> {
-        let file = self.open_lock_file()?;
-        fs2::FileExt::try_lock_exclusive(&file)?;
+    ) -> Result<LocalOperation<Exclusive>, fs::TryLockError> {
+        let file = self.open_lock_file().map_err(fs::TryLockError::Error)?;
+        file.try_lock()?;
         Ok(LocalOperation {
             protection: Arc::new(LocalProtection {
                 path: self.path.clone(),
@@ -197,7 +201,7 @@ impl Local {
     /// Returns a filesystem or lock acquisition failure.
     pub fn shared_operation(&self) -> io::Result<LocalOperation<Shared>> {
         let file = self.open_lock_file()?;
-        fs2::FileExt::lock_shared(&file)?;
+        file.lock_shared()?;
         Ok(LocalOperation {
             protection: Arc::new(LocalProtection {
                 path: self.path.clone(),
@@ -213,7 +217,7 @@ impl Local {
     /// Returns a filesystem or lock acquisition failure.
     pub fn exclusive_operation(&self) -> io::Result<LocalOperation<Exclusive>> {
         let file = self.open_lock_file()?;
-        fs2::FileExt::lock_exclusive(&file)?;
+        file.lock()?;
         Ok(LocalOperation {
             protection: Arc::new(LocalProtection {
                 path: self.path.clone(),
@@ -415,7 +419,6 @@ impl BackendThread for LocalThread {
 mod tests {
     use super::{lock_file_path, Local};
     use crate::backends::Backend;
-    use fs2::FileExt;
     use std::fs::{self, File};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -530,11 +533,11 @@ mod tests {
         pending.write_all(b"incomplete").unwrap();
         let observer = directory.observer();
         drop(operation);
-        assert!(observer.try_lock_exclusive().is_err());
+        assert!(observer.try_lock().is_err());
         assert!(!directory.0.join("object").exists());
         drop(pending);
         assert_no_temporary_files(&directory);
-        observer.try_lock_exclusive().unwrap();
+        observer.try_lock().unwrap();
     }
 
     #[test]
@@ -555,12 +558,12 @@ mod tests {
             .unwrap();
         let observer = directory.observer();
         drop(operation);
-        assert!(observer.try_lock_exclusive().is_err());
+        assert!(observer.try_lock().is_err());
         let mut contents = Vec::new();
         reader.read_to_end(&mut contents).unwrap();
         assert_eq!(contents, vec![42; 1024 * 1024]);
         drop(reader);
-        observer.try_lock_exclusive().unwrap();
+        observer.try_lock().unwrap();
     }
 
     #[test]
@@ -661,10 +664,10 @@ mod tests {
         drop(operation);
         drop(backend);
 
-        assert!(observer.try_lock_exclusive().is_err());
+        assert!(observer.try_lock().is_err());
         worker.list(PathBuf::new()).unwrap();
         drop(worker);
-        observer.try_lock_exclusive().unwrap();
+        observer.try_lock().unwrap();
     }
 
     #[test]
@@ -676,9 +679,9 @@ mod tests {
         let observer = directory.observer();
         drop(operation);
 
-        assert!(FileExt::try_lock_shared(&observer).is_err());
+        assert!(observer.try_lock_shared().is_err());
         drop(worker);
-        FileExt::try_lock_shared(&observer).unwrap();
+        observer.try_lock_shared().unwrap();
     }
 
     #[test]
@@ -690,9 +693,9 @@ mod tests {
         let observer = directory.observer();
 
         drop(first);
-        assert!(observer.try_lock_exclusive().is_err());
+        assert!(observer.try_lock().is_err());
         drop(second);
-        observer.try_lock_exclusive().unwrap();
+        observer.try_lock().unwrap();
     }
 
     #[test]
@@ -704,8 +707,8 @@ mod tests {
         let observer = directory.observer();
         drop(exclusive);
 
-        assert!(FileExt::try_lock_shared(&observer).is_err());
+        assert!(observer.try_lock_shared().is_err());
         drop(shared_capability);
-        FileExt::try_lock_shared(&observer).unwrap();
+        observer.try_lock_shared().unwrap();
     }
 }

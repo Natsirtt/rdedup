@@ -138,9 +138,15 @@ fn independent_shared_holders_exclude_gc_until_the_last_holder_exits() {
     let first = HolderProcess::start(directory.path(), Holder::Shared);
     let second = HolderProcess::start(directory.path(), Holder::Shared);
     drop(storage.try_shared_operation().unwrap());
-    assert!(storage.try_exclusive_operation().is_err());
+    assert!(matches!(
+        storage.try_exclusive_operation(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
     first.release();
-    assert!(storage.try_exclusive_operation().is_err());
+    assert!(matches!(
+        storage.try_exclusive_operation(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
     second.release();
     drop(storage.try_exclusive_operation().unwrap());
 }
@@ -151,8 +157,14 @@ fn an_independent_exclusive_holder_blocks_reads_and_writes_until_terminated() {
     let storage = Local::new(directory.path().join("."));
     drop(storage.try_shared_operation().unwrap());
     let holder = HolderProcess::start(directory.path(), Holder::Exclusive);
-    assert!(storage.try_shared_operation().is_err());
-    assert!(storage.try_exclusive_operation().is_err());
+    assert!(matches!(
+        storage.try_shared_operation(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    assert!(matches!(
+        storage.try_exclusive_operation(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
     holder.terminate();
     drop(storage.try_shared_operation().unwrap());
     drop(storage.try_exclusive_operation().unwrap());
@@ -166,7 +178,10 @@ fn independent_workers_and_streams_keep_the_original_protection_alive() {
             .unwrap();
         let storage = Local::new(directory.path().to_owned());
         let holder = HolderProcess::start(directory.path(), kind);
-        assert!(storage.try_exclusive_operation().is_err());
+        assert!(matches!(
+            storage.try_exclusive_operation(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
         holder.release();
         drop(storage.try_exclusive_operation().unwrap());
     }
@@ -182,7 +197,25 @@ fn a_symbolic_repository_alias_uses_the_same_cross_process_lock() {
     std::os::unix::fs::symlink(&repository, &alias).unwrap();
     let holder = HolderProcess::start(&repository, Holder::Exclusive);
     let storage = Local::new(alias);
-    assert!(storage.try_shared_operation().is_err());
+    assert!(matches!(
+        storage.try_shared_operation(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
     holder.release();
     drop(storage.try_exclusive_operation().unwrap());
+}
+
+#[test]
+fn inaccessible_lock_storage_is_not_contention() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join(".lock")).unwrap();
+    let storage = Local::new(directory.path().to_path_buf());
+    assert!(matches!(
+        storage.try_shared_operation(),
+        Err(std::fs::TryLockError::Error(_))
+    ));
+    assert!(matches!(
+        storage.try_exclusive_operation(),
+        Err(std::fs::TryLockError::Error(_))
+    ));
 }

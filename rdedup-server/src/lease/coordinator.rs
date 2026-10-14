@@ -421,7 +421,7 @@ impl LeaseService {
 
 struct PendingLock {
     admission: Admission,
-    result: JoinHandle<io::Result<Protection>>,
+    result: JoinHandle<Result<Protection, std::fs::TryLockError>>,
 }
 
 struct Coordinator {
@@ -526,19 +526,17 @@ impl Coordinator {
     fn complete_lock(
         &mut self,
         admission: Admission,
-        result: Result<io::Result<Protection>, tokio::task::JoinError>,
+        result: Result<
+            Result<Protection, std::fs::TryLockError>,
+            tokio::task::JoinError,
+        >,
     ) {
         let protection = match result {
             Ok(Ok(protection)) => protection,
-            Ok(Err(error))
-                if error.raw_os_error()
-                    == fs2::lock_contended_error().raw_os_error() =>
-            {
-                return
-            }
+            Ok(Err(std::fs::TryLockError::WouldBlock)) => return,
             result => {
                 let error = match result {
-                    Ok(Err(error)) => error,
+                    Ok(Err(error)) => io::Error::from(error),
                     Err(error) => io::Error::other(error),
                     Ok(Ok(_)) => unreachable!(
                         "successful lock acquisition returned above"

@@ -56,10 +56,8 @@ impl Server {
                 Ok(_protection) => {}
                 // Startup only probes access. Each request still acquires its
                 // own protection after an existing exclusive holder releases.
-                Err(error)
-                    if error.raw_os_error()
-                        == fs2::lock_contended_error().raw_os_error() => {}
-                Err(error) => return Err(error),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
             }
             Ok::<_, std::io::Error>(path)
         };
